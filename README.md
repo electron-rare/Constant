@@ -39,11 +39,13 @@ Current build status in this repo:
 - a 4-pane host-local Zellij session per machine
 - a fleet cockpit with one tab per machine
 - `Constant`, the orchestration CLI on top of the cockpit
+- a terminal TUI with a central `hexapus` buddy rail
 - local mission planning and verification
 - host-local execution for `claude`, `codex`, and `vibe`
 - `copilot` as a manual lane
 - local message bus + cross-machine bridge
 - MLX-ready model plumbing for a small local orchestrator stack on macOS
+- workspace-first durable memory with lexical + local vector search
 
 The historical repo name may still say `zellij-ai-triple`.
 The product name is now `Constant`.
@@ -178,9 +180,12 @@ codex login --device-auth
 
 ```bash
 ./scripts/Constant
+./scripts/Constant tui
 ./scripts/Constant doctor
 ./scripts/Constant mission create "audit the repo" --workspace "$PWD"
 ./scripts/Constant mission status
+./scripts/Constant memory rebuild --workspace "$PWD"
+./scripts/Constant memory search "buddy rail" --workspace "$PWD"
 ./scripts/Constant cockpit open --workspace "$PWD"
 ```
 
@@ -189,6 +194,25 @@ If `Constant` is on your `PATH`, you can also just run:
 ```bash
 Constant
 ```
+
+In interactive mode, `Constant` with no arguments now opens the TUI by default.
+
+### TUI keys
+
+`Constant tui` gives you:
+
+- a mission deck
+- a mission board
+- a `hexapus` buddy rail
+- a bottom timeline mixed with memory echoes
+
+Useful keys:
+
+- `j` / `k`: move between missions
+- `e`: rebuild memory for the current workspace
+- `s`: summarize the selected mission into durable memory
+- `z`: open the full fleet cockpit
+- `q`: quit the TUI
 
 ## Fleet Configuration
 
@@ -212,6 +236,15 @@ The command-center machine is where you run:
 - any human-in-the-loop supervision
 
 The workers are where execution happens.
+
+Public example config:
+
+```bash
+mkdir -p ~/.config/constant
+cp examples/fleet.example.json ~/.config/constant/fleet.json
+```
+
+Legacy `~/.config/constant/fleet.yaml` is still read for compatibility, but the public-facing format is now JSON.
 
 ## Messaging
 
@@ -290,13 +323,14 @@ Planned layers for the public `Constant` repo:
 ## Repo Layout
 
 ```text
-constant/                      Python orchestration core
-scripts/Constant               canonical CLI entrypoint
-scripts/constant-machine.sh    canonical single-machine cockpit entrypoint
-scripts/constant-fleet.sh      canonical fleet cockpit entrypoint
-scripts/constant-fleet-install.sh
-scripts/ai-msg.sh              local agent bus
-scripts/ai-bridge.sh           inter-machine bridge
+constant/                         Python orchestration core
+examples/fleet.example.json       public fleet template
+scripts/Constant                  canonical CLI entrypoint
+scripts/constant-machine.sh       canonical single-machine cockpit entrypoint
+scripts/constant-fleet.sh         canonical fleet cockpit entrypoint
+scripts/constant-fleet-install.sh canonical fleet installer/checker
+scripts/ai-msg.sh                 local agent bus
+scripts/ai-bridge.sh              inter-machine bridge
 ```
 
 ## Current Caveats

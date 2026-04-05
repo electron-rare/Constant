@@ -79,15 +79,31 @@ INSTRUCTION_FILES = ("CLAUDE.md", "AGENTS.md")
 INSTRUCTION_SUFFIXES = {".json", ".md", ".prompt", ".toml", ".txt", ".yaml", ".yml"}
 MAX_TEXT_BYTES = 256 * 1024
 MAX_INSTRUCTION_BYTES = 128 * 1024
+SQLITE_TIMEOUT_SECONDS = 10.0
+SQLITE_BUSY_TIMEOUT_MS = 10_000
+
+
+def _enable_wal(connection: sqlite3.Connection) -> None:
+    try:
+        row = connection.execute("pragma journal_mode").fetchone()
+        current_mode = str(row[0]).lower() if row else ""
+        if current_mode == "wal":
+            return
+        connection.execute("pragma journal_mode = wal")
+    except sqlite3.OperationalError:
+        # Another process may already hold the database. Keep the connection usable
+        # instead of failing the whole command or TUI refresh.
+        return
 
 
 def _connect() -> sqlite3.Connection:
     path = memory_store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path, timeout=SQLITE_TIMEOUT_SECONDS)
     connection.row_factory = sqlite3.Row
-    connection.execute("pragma journal_mode = wal")
+    connection.execute(f"pragma busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     connection.execute("pragma foreign_keys = on")
+    _enable_wal(connection)
     _ensure_schema(connection)
     return connection
 

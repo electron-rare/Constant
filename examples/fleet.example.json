@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "local_machine": "command-center",
+  "machines": [
+    {
+      "label": "command-center",
+      "target": "local",
+      "auto_clis": ["codex", "vibe", "claude"],
+      "manual_clis": ["copilot"],
+      "backends": ["omc", "cli-local", "zellij"]
+    },
+    {
+      "label": "builder-a",
+      "target": "dev@builder-a",
+      "auto_clis": ["codex", "vibe", "claude"],
+      "manual_clis": ["copilot"],
+      "backends": ["cli-ssh", "zellij"]
+    },
+    {
+      "label": "builder-b",
+      "target": "dev@builder-b",
+      "auto_clis": ["codex", "vibe", "claude"],
+      "manual_clis": ["copilot"],
+      "backends": ["cli-ssh", "zellij"]
+    },
+    {
+      "label": "edge-a",
+      "target": "dev@edge-a",
+      "auto_clis": ["codex", "vibe", "claude"],
+      "manual_clis": ["copilot"],
+      "backends": ["cli-ssh", "zellij"]
+    },
+    {
+      "label": "lab-a",
+      "target": "dev@lab-a",
+      "auto_clis": ["codex", "vibe", "claude"],
+      "manual_clis": ["copilot"],
+      "backends": ["cli-ssh", "zellij"]
+    }
+  ]
+}

@@ -11,6 +11,16 @@ from typing import Any
 from . import __version__
 from .daemon import daemon_status, request as daemon_request, serve_foreground, start_background, stop_background
 from .executors import bridge_sync, execute_step, fleet_check
+from .memory import (
+    enroll_workspace,
+    list_decisions,
+    memory_status,
+    persona_markdown,
+    rebuild_workspace_memory,
+    search_memory,
+    summarize_mission,
+    sync_qdrant,
+)
 from .paths import cache_root, repo_root, scripts_dir
 from .state import (
     append_event,
@@ -25,6 +35,7 @@ from .state import (
     save_mission,
     write_artifact,
 )
+from .tui import run_tui
 
 
 def _print(data: Any, as_json: bool = False) -> None:
@@ -42,6 +53,20 @@ def _command_exists(binary: str) -> bool:
         if candidate.exists() and os.access(candidate, os.X_OK):
             return True
     return False
+
+
+def _warm_memory(workspace: str) -> dict[str, Any] | None:
+    try:
+        return rebuild_workspace_memory(workspace, enroll=True)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "workspace": workspace}
+
+
+def _finalize_mission_memory(mission_id: str) -> dict[str, Any] | None:
+    try:
+        return summarize_mission(mission_id)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _ensure_planned(mission: dict[str, Any]) -> dict[str, Any]:
@@ -103,6 +128,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "daemon": status,
         "models": models,
         "health": health,
+        "memory": memory_status(),
         "fleet": [{"label": entry["label"], "target": entry["target"]} for entry in fleet["machines"]],
     }
     _print(report, args.json)
@@ -176,7 +202,22 @@ def cmd_cockpit_open(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tui(args: argparse.Namespace) -> int:
+    workspace = str(Path(args.workspace or os.getcwd()).expanduser().resolve())
+    action = run_tui(workspace)
+    if action and action.get("action") == "cockpit":
+        return cmd_cockpit_open(
+            argparse.Namespace(
+                workspace=action.get("workspace", workspace),
+                local_session=args.local_session,
+                session=args.session,
+            )
+        )
+    return 0
+
+
 def cmd_mission_create(args: argparse.Namespace) -> int:
+    _warm_memory(args.workspace)
     mission = create_mission(args.prompt, args.workspace)
     mission = _ensure_planned(mission)
     _print(_mission_summary(mission), args.json)
@@ -185,6 +226,7 @@ def cmd_mission_create(args: argparse.Namespace) -> int:
 
 def cmd_mission_plan(args: argparse.Namespace) -> int:
     mission = load_mission(args.mission_id)
+    _warm_memory(mission["workspace"])
     payload = daemon_request("plan", {"mission": mission})
     mission["steps"] = payload["plan"]["steps"]
     mission["title"] = payload["plan"]["title"]
@@ -243,6 +285,7 @@ def cmd_mission_run(args: argparse.Namespace) -> int:
             mission["status"] = "needs_human"
             save_mission(mission)
             append_event(mission["mission_id"], "step.needs_human", {"step_id": step["step_id"], "summary": verdict.get("summary", "")})
+            _finalize_mission_memory(mission["mission_id"])
             _print({"summary": _mission_summary(mission), "verdict": verdict}, args.json)
             return 1
         else:
@@ -250,6 +293,7 @@ def cmd_mission_run(args: argparse.Namespace) -> int:
             mission["status"] = "failed"
             save_mission(mission)
             append_event(mission["mission_id"], "step.failed", {"step_id": step["step_id"], "summary": verdict.get("summary", "")})
+            _finalize_mission_memory(mission["mission_id"])
             _print({"summary": _mission_summary(mission), "verdict": verdict}, args.json)
             return 1
 
@@ -260,6 +304,7 @@ def cmd_mission_run(args: argparse.Namespace) -> int:
     mission["status"] = "done"
     save_mission(mission)
     append_event(mission["mission_id"], "mission.done", {"mission_id": mission["mission_id"]})
+    _finalize_mission_memory(mission["mission_id"])
     _print(_mission_summary(mission), args.json)
     return 0
 
@@ -350,10 +395,54 @@ def cmd_delegate(args: argparse.Namespace) -> int:
 
 def cmd_buddy_ask(args: argparse.Namespace) -> int:
     mission = load_mission(args.mission_id) if args.mission_id else None
+    if mission:
+        _warm_memory(mission["workspace"])
     answer = daemon_request("buddy", {"mission": mission, "prompt": args.prompt})
     if mission:
         append_event(mission["mission_id"], "buddy.ask", {"prompt": args.prompt, "answer": answer})
     _print(answer, args.json)
+    return 0
+
+
+def cmd_memory_status(args: argparse.Namespace) -> int:
+    _print(memory_status(args.workspace), args.json)
+    return 0
+
+
+def cmd_memory_rebuild(args: argparse.Namespace) -> int:
+    _print(rebuild_workspace_memory(args.workspace, enroll=not args.no_enroll), args.json)
+    return 0
+
+
+def cmd_memory_enroll(args: argparse.Namespace) -> int:
+    _print(enroll_workspace(args.path), args.json)
+    return 0
+
+
+def cmd_memory_search(args: argparse.Namespace) -> int:
+    _print(search_memory(args.query, args.workspace, args.limit), args.json)
+    return 0
+
+
+def cmd_memory_persona_show(args: argparse.Namespace) -> int:
+    payload = {"persona": persona_markdown()} if args.json else persona_markdown()
+    _print(payload, args.json)
+    return 0
+
+
+def cmd_memory_decisions(args: argparse.Namespace) -> int:
+    _print(list_decisions(args.workspace, args.mission_id), args.json)
+    return 0
+
+
+def cmd_memory_sync_qdrant(args: argparse.Namespace) -> int:
+    payload = sync_qdrant(args.workspace)
+    _print(payload, args.json)
+    return 0 if payload.get("ok") or payload.get("skipped") else 1
+
+
+def cmd_mission_summarize(args: argparse.Namespace) -> int:
+    _print(summarize_mission(args.mission_id), args.json)
     return 0
 
 
@@ -365,6 +454,12 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor")
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(func=cmd_doctor)
+
+    tui = subparsers.add_parser("tui")
+    tui.add_argument("--workspace")
+    tui.add_argument("--local-session")
+    tui.add_argument("--session")
+    tui.set_defaults(func=cmd_tui)
 
     daemon = subparsers.add_parser("daemon")
     daemon_sub = daemon.add_subparsers(dest="daemon_command", required=True)
@@ -435,6 +530,10 @@ def build_parser() -> argparse.ArgumentParser:
     mission_retry.add_argument("--step-id")
     mission_retry.add_argument("--json", action="store_true")
     mission_retry.set_defaults(func=cmd_mission_retry)
+    mission_summarize = mission_sub.add_parser("summarize")
+    mission_summarize.add_argument("mission_id")
+    mission_summarize.add_argument("--json", action="store_true")
+    mission_summarize.set_defaults(func=cmd_mission_summarize)
 
     delegate = subparsers.add_parser("delegate")
     delegate.add_argument("mission_id")
@@ -454,6 +553,42 @@ def build_parser() -> argparse.ArgumentParser:
     buddy_ask.add_argument("--json", action="store_true")
     buddy_ask.set_defaults(func=cmd_buddy_ask)
 
+    memory = subparsers.add_parser("memory")
+    memory_sub = memory.add_subparsers(dest="memory_command", required=True)
+    memory_status_cmd = memory_sub.add_parser("status")
+    memory_status_cmd.add_argument("--workspace")
+    memory_status_cmd.add_argument("--json", action="store_true")
+    memory_status_cmd.set_defaults(func=cmd_memory_status)
+    memory_rebuild_cmd = memory_sub.add_parser("rebuild")
+    memory_rebuild_cmd.add_argument("--workspace", default=os.getcwd())
+    memory_rebuild_cmd.add_argument("--no-enroll", action="store_true")
+    memory_rebuild_cmd.add_argument("--json", action="store_true")
+    memory_rebuild_cmd.set_defaults(func=cmd_memory_rebuild)
+    memory_enroll_cmd = memory_sub.add_parser("enroll")
+    memory_enroll_cmd.add_argument("path")
+    memory_enroll_cmd.add_argument("--json", action="store_true")
+    memory_enroll_cmd.set_defaults(func=cmd_memory_enroll)
+    memory_search_cmd = memory_sub.add_parser("search")
+    memory_search_cmd.add_argument("query")
+    memory_search_cmd.add_argument("--workspace")
+    memory_search_cmd.add_argument("--limit", type=int)
+    memory_search_cmd.add_argument("--json", action="store_true")
+    memory_search_cmd.set_defaults(func=cmd_memory_search)
+    memory_persona_cmd = memory_sub.add_parser("persona")
+    memory_persona_sub = memory_persona_cmd.add_subparsers(dest="memory_persona_command", required=True)
+    memory_persona_show_cmd = memory_persona_sub.add_parser("show")
+    memory_persona_show_cmd.add_argument("--json", action="store_true")
+    memory_persona_show_cmd.set_defaults(func=cmd_memory_persona_show)
+    memory_decisions_cmd = memory_sub.add_parser("decisions")
+    memory_decisions_cmd.add_argument("--workspace")
+    memory_decisions_cmd.add_argument("--mission-id")
+    memory_decisions_cmd.add_argument("--json", action="store_true")
+    memory_decisions_cmd.set_defaults(func=cmd_memory_decisions)
+    memory_sync_cmd = memory_sub.add_parser("sync-qdrant")
+    memory_sync_cmd.add_argument("--workspace")
+    memory_sync_cmd.add_argument("--json", action="store_true")
+    memory_sync_cmd.set_defaults(func=cmd_memory_sync_qdrant)
+
     hidden = subparsers.add_parser("__serve")
     hidden.set_defaults(func=lambda _args: serve_foreground())
 
@@ -465,7 +600,7 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
     if not argv:
         if sys.stdin.isatty() and sys.stdout.isatty():
-            argv = ["cockpit", "open", "--workspace", os.getcwd()]
+            argv = ["tui", "--workspace", os.getcwd()]
         else:
             argv = ["doctor"]
     parser = build_parser()

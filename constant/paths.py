@@ -32,15 +32,15 @@ def missions_dir() -> Path:
 
 
 def fleet_config_path() -> Path:
-    return config_root() / "fleet.yaml"
+    return config_root() / "fleet.json"
 
 
 def models_config_path() -> Path:
-    return config_root() / "models.yaml"
+    return config_root() / "models.json"
 
 
 def memory_config_path() -> Path:
-    return config_root() / "memory.yaml"
+    return config_root() / "memory.json"
 
 
 def daemon_pid_path() -> Path:

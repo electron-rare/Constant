@@ -112,8 +112,19 @@ def ensure_runtime_dirs() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 
+def _legacy_config_path(path: Path) -> Path:
+    if path.suffix == ".json":
+        return path.with_suffix(".yaml")
+    return path
+
+
 def _read_json_yaml(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     ensure_runtime_dirs()
+    legacy_path = _legacy_config_path(path)
+
+    if not path.exists() and legacy_path != path and legacy_path.exists():
+        return json.loads(legacy_path.read_text(encoding="utf-8"))
+
     if not path.exists():
         _write_json_yaml(path, default)
         return deepcopy(default)
