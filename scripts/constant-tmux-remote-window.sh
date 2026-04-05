@@ -103,6 +103,9 @@ done
 if zellij_ai_is_local_target "$target"; then
     local_repo_dir="$(zellij_ai_expand_home_path "$repo_dir")"
     local_workspace="$(zellij_ai_expand_home_path "$workspace")"
+    if [[ ! -d "$local_workspace" ]]; then
+        local_workspace="$local_repo_dir"
+    fi
     launcher="$local_repo_dir/scripts/constant-machine.sh"
     args=(
         --workspace "$local_workspace"
@@ -119,18 +122,62 @@ if zellij_ai_is_local_target "$target"; then
     exec env ZELLIJ_AI_MACHINE_NAME="$label" "$launcher" "${args[@]}"
 fi
 
-printf -v remote_inner 'repo_dir=%q; workspace=%q; session_name=%q; repo_dir="${repo_dir#\\}"; workspace="${workspace#\\}"; case "$repo_dir" in \$HOME|\$HOME/*) repo_dir="${HOME}${repo_dir#\$HOME}" ;; "~") repo_dir="$HOME" ;; ~/*) repo_dir="$HOME/${repo_dir#~/}" ;; esac; case "$workspace" in \$HOME|\$HOME/*) workspace="${HOME}${workspace#\$HOME}" ;; "~") workspace="$HOME" ;; ~/*) workspace="$HOME/${workspace#~/}" ;; esac; launcher="$repo_dir/scripts/constant-machine.sh"; if [[ ! -x "$launcher" ]]; then launcher="$repo_dir/scripts/constant-tmux-machine.sh"; fi; args=(--workspace "$workspace" --session "$session_name" --repo-dir "$repo_dir");' \
-    "$repo_dir" \
-    "$workspace" \
-    "$session"
-
-if [[ -n "$claude_config_dir" ]]; then
-    printf -v remote_inner '%s args+=(--claude-config-dir %q);' "$remote_inner" "$claude_config_dir"
-fi
-
+printf -v repo_dir_q '%q' "$repo_dir"
+printf -v workspace_q '%q' "$workspace"
+printf -v session_q '%q' "$session"
+printf -v claude_config_q '%q' "$claude_config_dir"
+printf -v label_q '%q' "$label"
+recreate_literal=false
 if $recreate; then
-    printf -v remote_inner '%s args+=(--recreate);' "$remote_inner"
+    recreate_literal=true
 fi
 
-printf -v remote_inner '%s exec env ZELLIJ_AI_MACHINE_NAME=%q ZELLIJ_AI_FORCE_OSC52=true "$launcher" "${args[@]}"' "$remote_inner" "$label"
-exec ssh -tt "$target" bash -lc "$remote_inner"
+read -r -d '' remote_shell <<EOF || true
+set -euo pipefail
+
+expand_home_path() {
+    case "\$1" in
+        '\$HOME'|'\$HOME/'*)
+            printf '%s\n' "\${HOME}\${1#\\\$HOME}"
+            ;;
+        "~")
+            printf '%s\n' "\$HOME"
+            ;;
+        "~/"*)
+            printf '%s\n' "\$HOME/\${1#~/}"
+            ;;
+        *)
+            printf '%s\n' "\$1"
+            ;;
+    esac
+}
+
+repo_dir_input=$repo_dir_q
+workspace_input=$workspace_q
+session_name=$session_q
+claude_config_dir_input=$claude_config_q
+recreate=$recreate_literal
+
+repo_dir="\$(expand_home_path "\$repo_dir_input")"
+workspace="\$(expand_home_path "\$workspace_input")"
+claude_config_dir="\$(expand_home_path "\$claude_config_dir_input")"
+if [[ ! -d "\$workspace" ]]; then
+    workspace="\$repo_dir"
+fi
+launcher="\$repo_dir/scripts/constant-machine.sh"
+if [[ ! -x "\$launcher" ]]; then
+    launcher="\$repo_dir/scripts/constant-tmux-machine.sh"
+fi
+
+args=(--workspace "\$workspace" --session "\$session_name" --repo-dir "\$repo_dir")
+if [[ -n "\$claude_config_dir_input" ]]; then
+    args+=(--claude-config-dir "\$claude_config_dir")
+fi
+if \$recreate; then
+    args+=(--recreate)
+fi
+
+exec env ZELLIJ_AI_MACHINE_NAME=$label_q ZELLIJ_AI_FORCE_OSC52=true "\$launcher" "\${args[@]}"
+EOF
+
+exec ssh -tt "$target" "bash -lc $(printf '%q' "$remote_shell")"

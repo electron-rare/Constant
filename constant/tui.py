@@ -9,7 +9,7 @@ from typing import Any
 
 from .cockpit import ROLES, capture_pane, focus_machine, restart_pane, runtime_status
 from .daemon import request as daemon_request
-from .memory import list_decisions, memory_status, persona_markdown, rebuild_workspace_memory, summarize_mission
+from .memory import list_decisions, memory_status, persona_markdown, prime_workspace_memory, rebuild_workspace_memory, summarize_mission
 from .state import list_missions, load_fleet_config, mission_events_file
 
 
@@ -621,7 +621,7 @@ def _run(stdscr: Any, workspace: str, local_session: str, machine_session: str) 
 
 def run_tui(workspace: str, local_session: str = "constant-fleet", machine_session: str = "constant") -> dict[str, Any] | None:
     try:
-        rebuild_workspace_memory(workspace, enroll=True)
+        prime_workspace_memory(workspace, enroll=True)
     except Exception:
         pass
     return curses.wrapper(lambda stdscr: _run(stdscr, str(Path(workspace).expanduser().resolve()), local_session, machine_session))

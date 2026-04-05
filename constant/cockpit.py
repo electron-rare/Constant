@@ -34,11 +34,12 @@ def _tmux_list_command(session_name: str) -> list[str]:
 
 
 def _ssh_command(target: str, inner: str) -> list[str]:
-    prefixed = (
-        'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"; '
+    remote_shell = (
+        'PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"; '
+        "export PATH; "
         f"{inner}"
     )
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=1", target, "bash", "--noprofile", "--norc", "-lc", prefixed]
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=1", target, remote_shell]
 
 
 def _machine_session_name(session_name: str, machine_label: str) -> str:

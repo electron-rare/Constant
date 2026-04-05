@@ -722,6 +722,44 @@ def rebuild_workspace_memory(workspace: str | Path, enroll: bool = True) -> dict
         connection.close()
 
 
+def prime_workspace_memory(workspace: str | Path, enroll: bool = True) -> dict[str, Any]:
+    workspace_path = _normalize_workspace(workspace)
+    config = load_memory_config()
+    if enroll and str(workspace_path) not in config["workspace_enrollments"]:
+        config["workspace_enrollments"].append(str(workspace_path))
+        config["workspace_enrollments"] = sorted(set(config["workspace_enrollments"]))
+        save_memory_config(config)
+
+    connection = _connect()
+    try:
+        _upsert_workspace(connection, workspace_path)
+        row = connection.execute(
+            """
+            select count(*) as document_count, max(updated_at) as last_document_at
+            from documents
+            where workspace = ?
+            """,
+            (str(workspace_path),),
+        ).fetchone()
+        workspace_row = connection.execute(
+            "select repo_root, last_indexed_at from workspaces where path = ?",
+            (str(workspace_path),),
+        ).fetchone()
+        connection.commit()
+        return {
+            "workspace": str(workspace_path),
+            "repo_root": str(workspace_row["repo_root"]) if workspace_row else str(_detect_repo_root(workspace_path)),
+            "enrolled": str(workspace_path) in load_memory_config()["workspace_enrollments"],
+            "documents": int(row["document_count"] or 0) if row else 0,
+            "last_document_at": row["last_document_at"] if row else None,
+            "last_indexed_at": workspace_row["last_indexed_at"] if workspace_row else None,
+            "store_path": str(memory_store_path()),
+            "mode": "prime",
+        }
+    finally:
+        connection.close()
+
+
 def memory_status(workspace: str | None = None) -> dict[str, Any]:
     connection = _connect()
     try:
