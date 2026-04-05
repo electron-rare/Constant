@@ -18,9 +18,9 @@ fi
 if [[ -n "$bootstrap_file" && ! -f "$bootstrap_file" ]]; then
     : >"$bootstrap_file"
 
-    printf -v codex_cmd '%q' "$script_dir/zellij-ai-codex-pane.sh"
-    printf -v copilot_cmd '%q' "$script_dir/zellij-ai-copilot-pane.sh"
-    printf -v vibe_cmd '%q' "$script_dir/zellij-ai-vibe-pane.sh"
+    printf -v codex_cmd '%q' "$script_dir/constant-codex-pane.sh"
+    printf -v copilot_cmd '%q' "$script_dir/constant-copilot-pane.sh"
+    printf -v vibe_cmd '%q' "$script_dir/constant-vibe-pane.sh"
 
     zellij action new-pane -d right -n "${ZELLIJ_AI_CODEX_LABEL:-codex}" --cwd "$workspace"
     zellij action move-focus right
@@ -40,4 +40,4 @@ if [[ -n "$bootstrap_file" && ! -f "$bootstrap_file" ]]; then
     zellij action move-focus left
 fi
 
-exec "$script_dir/zellij-ai-claude-pane.sh"
+exec "$script_dir/constant-claude-pane.sh"

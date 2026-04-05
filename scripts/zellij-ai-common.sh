@@ -96,7 +96,7 @@ zellij_ai_default_codex_image() {
 }
 
 zellij_ai_runtime_root() {
-    printf '%s\n' "${ZELLIJ_AI_RUNTIME_ROOT:-$HOME/.cache/constant/zellij}"
+    printf '%s\n' "${ZELLIJ_AI_RUNTIME_ROOT:-$HOME/.cache/constant/cockpit}"
 }
 
 zellij_ai_session_state_dir() {
@@ -133,7 +133,7 @@ zellij_ai_strip_ansi() {
 }
 
 zellij_ai_session_exists() {
-    zellij list-sessions 2>/dev/null | zellij_ai_strip_ansi | awk '{print $1}' | grep -Fxq "$1"
+    tmux has-session -t "$1" >/dev/null 2>&1
 }
 
 zellij_ai_kdl_escape() {
@@ -270,4 +270,87 @@ zellij_ai_agent_path() {
     fi
 
     printf '%s\n' "$path_value"
+}
+
+constant_tmux_require() {
+    zellij_ai_require_command tmux
+}
+
+constant_tmux_session_exists() {
+    tmux has-session -t "$1" >/dev/null 2>&1
+}
+
+constant_tmux_window_exists() {
+    local session_name="$1"
+    local window_name="$2"
+    tmux list-windows -t "$session_name" -F '#{window_name}' 2>/dev/null | grep -Fxq "$window_name"
+}
+
+constant_tmux_base_command() {
+    local role="$1"
+    local launcher="$2"
+    local workspace="$3"
+    local repo_dir="$4"
+    local session_name="$5"
+    local bus_dir="$6"
+    local machine_name="$7"
+    local codex_home="$8"
+    local claude_config_dir="$9"
+    local inner
+
+    printf -v inner \
+        'cd %q && export ZELLIJ_AI_WORKSPACE=%q ZELLIJ_AI_REPO_DIR=%q ZELLIJ_AI_SESSION=%q ZELLIJ_AI_BUS_DIR=%q ZELLIJ_AI_MACHINE_NAME=%q ZELLIJ_AI_CODEX_HOME=%q ZELLIJ_AI_CODEX_LABEL=%q ZELLIJ_AI_COPILOT_LABEL=%q ZELLIJ_AI_VIBE_LABEL=%q ZELLIJ_AI_ROLE=%q PATH=%q;' \
+        "$workspace" \
+        "$workspace" \
+        "$repo_dir" \
+        "$session_name" \
+        "$bus_dir" \
+        "$machine_name" \
+        "$codex_home" \
+        "codex" \
+        "copilot" \
+        "vibe" \
+        "$role" \
+        "$(zellij_ai_agent_path)"
+
+    if [[ -n "$claude_config_dir" ]]; then
+        printf -v inner '%s export ZELLIJ_AI_CLAUDE_CONFIG_DIR=%q;' "$inner" "$claude_config_dir"
+    fi
+
+    printf -v inner '%s exec %q' "$inner" "$launcher"
+    printf 'bash -lc %q' "$inner"
+}
+
+constant_tmux_role_command() {
+    local role="$1"
+    local script_dir="$2"
+    local workspace="$3"
+    local repo_dir="$4"
+    local session_name="$5"
+    local bus_dir="$6"
+    local machine_name="$7"
+    local codex_home="$8"
+    local claude_config_dir="$9"
+    local launcher=""
+
+    case "$role" in
+        claude)
+            launcher="$script_dir/constant-claude-pane.sh"
+            ;;
+        codex)
+            launcher="$script_dir/constant-codex-pane.sh"
+            ;;
+        copilot)
+            launcher="$script_dir/constant-copilot-pane.sh"
+            ;;
+        vibe)
+            launcher="$script_dir/constant-vibe-pane.sh"
+            ;;
+        *)
+            echo "Unknown Constant pane role: $role" >&2
+            return 1
+            ;;
+    esac
+
+    constant_tmux_base_command "$role" "$launcher" "$workspace" "$repo_dir" "$session_name" "$bus_dir" "$machine_name" "$codex_home" "$claude_config_dir"
 }

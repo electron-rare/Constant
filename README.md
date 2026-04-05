@@ -19,7 +19,7 @@ Not another “agent framework” that only looks good in slides.
 
 It is a pragmatic, local-first orchestration layer that sits on top of:
 
-- a 4-pane Zellij machine cockpit
+- a 4-pane `tmux` machine cockpit
 - a multi-machine fleet view
 - host-local CLIs like `claude`, `codex`, `copilot`, and `vibe`
 - a mission runner that can route work across machines
@@ -36,10 +36,11 @@ The vibe is somewhere between:
 
 Current build status in this repo:
 
-- a 4-pane host-local Zellij session per machine
-- a fleet cockpit with one tab per machine
+- a 4-pane host-local `tmux` session per machine
+- a fleet cockpit with one window per machine plus a central `Constant` window
 - `Constant`, the orchestration CLI on top of the cockpit
 - a terminal TUI with a central `hexapus` buddy rail
+- live cockpit controls for focus, capture, send, and pane restart
 - local mission planning and verification
 - host-local execution for `claude`, `codex`, and `vibe`
 - `copilot` as a manual lane
@@ -47,8 +48,8 @@ Current build status in this repo:
 - MLX-ready model plumbing for a small local orchestrator stack on macOS
 - workspace-first durable memory with lexical + local vector search
 
-The historical repo name may still say `zellij-ai-triple`.
-The product name is now `Constant`.
+The canonical script surface is `constant-*`.
+Legacy `zellij-ai-*` aliases remain only as compatibility shims.
 
 ## Why This Exists
 
@@ -91,12 +92,13 @@ No Docker dependency is required for the standard session.
 
 ### 2. Fleet cockpit
 
-From your command center machine, you open one Zellij tab per machine.
-Each tab attaches to the machine’s own local session.
+From your command center machine, you open one `tmux` window per machine plus a central `Constant` window.
+Each machine window attaches to that machine’s own local `tmux` session.
 
 That gives you:
 
 - one place to supervise the whole fleet
+- one active orchestration surface in the `Constant` window
 - local clipboard behavior on the operator machine
 - remote sessions that stay remote
 - a clean separation between orchestration and execution
@@ -132,7 +134,7 @@ The design goal is simple:
 
 ### Requirements
 
-- `zellij`
+- `tmux`
 - `git`
 - `node`
 - `npm`
@@ -163,12 +165,11 @@ uv tool install mistral-vibe
 ./scripts/constant-fleet.sh --workspace "$PWD"
 ```
 
-By default, the machine launcher creates a fresh temporary Zellij config directory for each new session.
-That is deliberate: it isolates `Constant` from an existing user Zellij config, custom layouts, plugins,
-and stale resurrected state. If you want to pin a specific Zellij config dir, use:
+For non-interactive setup or tests, you can create the sessions without attaching:
 
 ```bash
-./scripts/constant-machine.sh --zellij-config-dir /path/to/zellij-config
+./scripts/constant-machine.sh --workspace "$PWD" --ensure-only
+./scripts/constant-fleet.sh --workspace "$PWD" --ensure-only
 ```
 
 On first launch of the Codex pane, if `auth.json` is missing in its profile, the pane runs:
@@ -183,6 +184,10 @@ codex login --device-auth
 ./scripts/Constant
 ./scripts/Constant tui
 ./scripts/Constant doctor
+./scripts/Constant cockpit doctor --json
+./scripts/Constant cockpit status --json
+./scripts/Constant cockpit focus --machine command-center --pane codex
+./scripts/Constant cockpit capture --machine command-center --pane claude
 ./scripts/Constant mission create "audit the repo" --workspace "$PWD"
 ./scripts/Constant mission status
 ./scripts/Constant memory rebuild --workspace "$PWD"
@@ -252,12 +257,18 @@ Constant fleet configure \
 
 - a mission deck
 - a mission board
+- a runtime view of machine windows and pane states
 - a `hexapus` buddy rail
 - a bottom timeline mixed with memory echoes
 
 Useful keys:
 
 - `j` / `k`: move between missions
+- `[` / `]`: move between machines in the runtime view
+- `1`..`4`: focus `claude`, `codex`, `copilot`, `vibe` on the selected machine
+- `o`: jump to the selected machine window
+- `r`: restart the selected pane
+- `x`: capture a short preview of the selected pane
 - `e`: rebuild memory for the current workspace
 - `s`: summarize the selected mission into durable memory
 - `z`: open the full fleet cockpit
@@ -301,7 +312,7 @@ The shell launchers also read `fleet.json` now, so fleet tabs, install/check, an
 Each machine exposes a local bus:
 
 ```text
-~/.cache/constant/zellij/<session>/bus
+~/.cache/constant/cockpit/<session>/bus
 ```
 
 Use it from any pane:
@@ -332,9 +343,7 @@ Clipboard behavior is split on purpose:
 - remote tabs rely on `OSC52`
 - the command center keeps ownership of the actual system clipboard
 
-This matters.
-
-If a remote pane copies text, it should land in the operator machine clipboard, not in some random remote shell session.
+The current runtime relies on `tmux` clipboard forwarding and terminal `OSC52` behavior when you are driving remote sessions from the command center.
 
 ## Constant Philosophy
 
@@ -390,6 +399,7 @@ scripts/ai-bridge.sh              inter-machine bridge
 - the public-facing TUI is still evolving
 - some setup paths and local assumptions are operator-oriented
 - `copilot` is manual-only in the current autonomous flow
+- remote `tmux` introspection is best when targets expose `tmux` on a non-interactive shell `PATH`
 
 That is acceptable for now.
 The system is being built in the open, from the terminal outward.

@@ -9,5 +9,5 @@ while [[ -L "$script_source" ]]; do
 done
 script_dir="$(cd "$(dirname "$script_source")" && pwd -P)"
 
-export CONSTANT_SCRIPT_NAME="$(basename "$0")"
-exec "$script_dir/constant-tmux-machine.sh" "$@"
+export CONSTANT_SCRIPT_NAME="${CONSTANT_SCRIPT_NAME:-$(basename "$0")}"
+exec "$script_dir/zellij-ai-machine-install.sh" "$@"

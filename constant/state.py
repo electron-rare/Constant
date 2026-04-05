@@ -31,35 +31,35 @@ DEFAULT_FLEET: dict[str, Any] = {
             "target": "local",
             "auto_clis": ["codex", "vibe", "claude"],
             "manual_clis": ["copilot"],
-            "backends": ["omc", "cli-local", "zellij"],
+            "backends": ["omc", "cli-local", "cockpit"],
         },
         {
             "label": "builder-a",
             "target": "dev@builder-a",
             "auto_clis": ["codex", "vibe", "claude"],
             "manual_clis": ["copilot"],
-            "backends": ["cli-ssh", "zellij"],
+            "backends": ["cli-ssh", "cockpit"],
         },
         {
             "label": "builder-b",
             "target": "dev@builder-b",
             "auto_clis": ["codex", "vibe", "claude"],
             "manual_clis": ["copilot"],
-            "backends": ["cli-ssh", "zellij"],
+            "backends": ["cli-ssh", "cockpit"],
         },
         {
             "label": "edge-a",
             "target": "dev@edge-a",
             "auto_clis": ["codex", "vibe", "claude"],
             "manual_clis": ["copilot"],
-            "backends": ["cli-ssh", "zellij"],
+            "backends": ["cli-ssh", "cockpit"],
         },
         {
             "label": "lab-a",
             "target": "dev@lab-a",
             "auto_clis": ["codex", "vibe", "claude"],
             "manual_clis": ["copilot"],
-            "backends": ["cli-ssh", "zellij"],
+            "backends": ["cli-ssh", "cockpit"],
         },
     ],
 }
@@ -140,7 +140,13 @@ def _write_json_yaml(path: Path, payload: dict[str, Any]) -> None:
 
 
 def load_fleet_config() -> dict[str, Any]:
-    return _read_json_yaml(fleet_config_path(), DEFAULT_FLEET)
+    payload = _read_json_yaml(fleet_config_path(), DEFAULT_FLEET)
+    for machine in payload.get("machines", []):
+        backends = []
+        for backend in machine.get("backends", []):
+            backends.append("cockpit" if backend == "zellij" else backend)
+        machine["backends"] = backends
+    return payload
 
 
 def load_models_config() -> dict[str, Any]:

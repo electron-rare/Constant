@@ -9,7 +9,7 @@ while [[ -L "$script_source" ]]; do
 done
 script_dir="$(cd "$(dirname "$script_source")" && pwd -P)"
 repo_source="$(cd "$script_dir/.." && pwd -P)"
-source "$script_dir/zellij-ai-common.sh"
+source "$script_dir/constant-common.sh"
 
 usage() {
     local script_name="${CONSTANT_SCRIPT_NAME:-$(basename "$0")}"
@@ -176,20 +176,20 @@ for machine_spec in "${machines[@]}"; do
     fi
 
     if zellij_ai_is_local_target "$target"; then
-        ZELLIJ_AI_MACHINE_NAME="$label" "$script_dir/zellij-ai-machine-install.sh" "${install_args[@]}" || overall_status=1
+        ZELLIJ_AI_MACHINE_NAME="$label" "$script_dir/constant-machine-install.sh" "${install_args[@]}" || overall_status=1
         continue
     fi
 
     if [[ "$mode" == "install" ]]; then
-        remote_script="${target_repo_dir}/scripts/zellij-ai-machine-install.sh"
+        remote_script="${target_repo_dir}/scripts/constant-machine-install.sh"
         ssh -tt "$target" env ZELLIJ_AI_MACHINE_NAME="$label" "$remote_script" "${install_args[@]}" || overall_status=1
         continue
     fi
 
     if $yes; then
-        ssh "$target" env ZELLIJ_AI_MACHINE_NAME="$label" bash -s -- "${install_args[@]}" <"$script_dir/zellij-ai-machine-install.sh" || overall_status=1
+        ssh "$target" env ZELLIJ_AI_MACHINE_NAME="$label" bash -s -- "${install_args[@]}" <"$script_dir/constant-machine-install.sh" || overall_status=1
     else
-        ssh "$target" env ZELLIJ_AI_MACHINE_NAME="$label" bash -s -- "${install_args[@]}" <"$script_dir/zellij-ai-machine-install.sh" || overall_status=1
+        ssh "$target" env ZELLIJ_AI_MACHINE_NAME="$label" bash -s -- "${install_args[@]}" <"$script_dir/constant-machine-install.sh" || overall_status=1
     fi
 done
 

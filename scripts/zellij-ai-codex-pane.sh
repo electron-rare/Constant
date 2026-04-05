@@ -8,11 +8,12 @@ while [[ -L "$script_source" ]]; do
     [[ "$script_source" != /* ]] && script_source="$script_dir/$script_source"
 done
 script_dir="$(cd "$(dirname "$script_source")" && pwd -P)"
-source "$script_dir/zellij-ai-common.sh"
+source "$script_dir/constant-common.sh"
 
 usage() {
-    cat <<'EOF'
-Usage: zellij-ai-codex-pane.sh [slot]
+    local script_name="${CONSTANT_SCRIPT_NAME:-$(basename "$0")}"
+    cat <<EOF
+Usage: ${script_name} [slot]
 
 slot:
   1     Deprecated alias for the single host-local Codex pane

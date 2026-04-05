@@ -10,4 +10,4 @@ done
 script_dir="$(cd "$(dirname "$script_source")" && pwd -P)"
 
 export CONSTANT_SCRIPT_NAME="$(basename "$0")"
-exec "$script_dir/zellij-ai-fleet-deploy.sh" "$@"
+exec "$script_dir/constant-fleet-deploy.sh" "$@"

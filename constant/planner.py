@@ -303,7 +303,7 @@ class PlannerEngine:
                     "goal": mission["goal"],
                     "workspace": mission["workspace"],
                     "machines": machine_labels,
-                    "allowed_backends": ["omc", "cli-local", "cli-ssh", "zellij"],
+                    "allowed_backends": ["omc", "cli-local", "cli-ssh", "cockpit"],
                     "allowed_clis": ["claude", "codex", "vibe"],
                 },
                 indent=2,

@@ -8,7 +8,7 @@ while [[ -L "$script_source" ]]; do
     [[ "$script_source" != /* ]] && script_source="$script_dir/$script_source"
 done
 script_dir="$(cd "$(dirname "$script_source")" && pwd -P)"
-source "$script_dir/zellij-ai-common.sh"
+source "$script_dir/constant-common.sh"
 
 usage() {
     local script_name="${CONSTANT_SCRIPT_NAME:-$(basename "$0")}"
@@ -450,7 +450,7 @@ for raw in finalized.read_text(encoding="utf-8").splitlines():
                 "target": "local",
                 "auto_clis": ["codex", "vibe", "claude"],
                 "manual_clis": ["copilot"],
-                "backends": ["omc", "cli-local", "zellij"],
+                "backends": ["omc", "cli-local", "cockpit"],
             }
         )
     else:
@@ -460,7 +460,7 @@ for raw in finalized.read_text(encoding="utf-8").splitlines():
                 "target": f"{user}@{seed}",
                 "auto_clis": ["codex", "vibe", "claude"],
                 "manual_clis": ["copilot"],
-                "backends": ["cli-ssh", "zellij"],
+                "backends": ["cli-ssh", "cockpit"],
             }
         )
 

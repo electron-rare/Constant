@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .cockpit import ROLES, capture_pane, focus_machine, restart_pane, runtime_status
 from .daemon import request as daemon_request
 from .memory import list_decisions, memory_status, persona_markdown, rebuild_workspace_memory, summarize_mission
 from .state import list_missions, load_fleet_config, mission_events_file
@@ -44,6 +45,18 @@ def _safe_decision_lines(workspace: str) -> list[str]:
         return [f"{item['decision_id'].split(':')[-1]} {item['status']} {item['title']}" for item in decisions]
     except Exception as exc:  # noqa: BLE001
         return [_error_line("decisions", exc)]
+
+
+def _safe_runtime_status(local_session: str, machine_session: str) -> dict[str, Any]:
+    try:
+        return runtime_status(local_session=local_session, machine_session=machine_session)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "fleet_session_exists": False,
+            "machines": [],
+            "fleet_windows": [],
+            "fleet_stderr": _error_line("cockpit", exc),
+        }
 
 
 def _clip(text: str, width: int) -> str:
@@ -219,17 +232,29 @@ def _status_tag(status: str) -> str:
     }.get(status, status[:4].upper())
 
 
-def _draw_header(stdscr: Any, workspace: str, mission_count: int, fleet_count: int, memory: dict[str, Any], health: dict[str, Any], colors: dict[str, int]) -> None:
+def _role_state(machine: dict[str, Any], role: str) -> str:
+    pane = machine.get("roles", {}).get(role)
+    if not pane:
+        return ".."
+    if pane.get("dead"):
+        return "xx"
+    if pane.get("active"):
+        return ">>"
+    return "ok"
+
+
+def _draw_header(stdscr: Any, workspace: str, mission_count: int, fleet_count: int, runtime: dict[str, Any], memory: dict[str, Any], health: dict[str, Any], colors: dict[str, int]) -> None:
     memory_counts = memory.get("counts", {})
     planner_backend = health.get("models", {}).get("planner", {}).get("backend", "heuristic")
     buddy_backend = health.get("models", {}).get("buddy", {}).get("backend", "heuristic")
+    cockpit_state = "up" if runtime.get("fleet_session_exists") else "down"
     _safe_addstr(stdscr, 0, 2, "########## CONSTANT::DEMOSCENE::TUI ##########", colors["accent"])
     _safe_addstr(
         stdscr,
         1,
         2,
         _clip(
-            f"workspace={workspace}  fleet={fleet_count}  missions={mission_count}  docs={memory_counts.get('documents', 0)}  chunks={memory_counts.get('chunks', 0)}  decisions={memory_counts.get('decisions', 0)}",
+            f"workspace={workspace}  fleet={fleet_count}  cockpit={cockpit_state}  missions={mission_count}  docs={memory_counts.get('documents', 0)}  chunks={memory_counts.get('chunks', 0)}  decisions={memory_counts.get('decisions', 0)}",
             max(20, stdscr.getmaxyx()[1] - 4),
         ),
         colors["base"],
@@ -239,7 +264,7 @@ def _draw_header(stdscr: Any, workspace: str, mission_count: int, fleet_count: i
         2,
         2,
         _clip(
-            f"planner={planner_backend}  buddy={buddy_backend}  keys: j/k move  z cockpit  e index  s summarize  q quit",
+            f"planner={planner_backend}  buddy={buddy_backend}  keys: j/k mission  [/ ] machine  1..4 pane  o jump  r restart  z cockpit  q quit",
             max(20, stdscr.getmaxyx()[1] - 4),
         ),
         colors["muted"],
@@ -304,6 +329,46 @@ def _draw_board(stdscr: Any, y: int, x: int, height: int, width: int, mission: d
             break
 
 
+def _draw_runtime(
+    stdscr: Any,
+    y: int,
+    x: int,
+    height: int,
+    width: int,
+    runtime: dict[str, Any],
+    selected_machine: int,
+    selected_role: str,
+    colors: dict[str, int],
+) -> None:
+    _draw_box(stdscr, y, x, height, width, "Cockpit Runtime", colors["accent"])
+    row = y + 1
+    machines = runtime.get("machines", [])
+    if not machines:
+        _safe_addstr(stdscr, row, x + 2, "No runtime data yet. Open the cockpit with z.", colors["muted"])
+        return
+
+    header = "machine            claude codex copilot vibe  session  target"
+    _safe_addstr(stdscr, row, x + 2, _clip(header, width - 4), colors["hot"])
+    row += 1
+
+    for index, machine in enumerate(machines[: max(1, height - 3)]):
+        marker = ">" if index == selected_machine else " "
+        attr = colors["accent"] if index == selected_machine else colors["base"]
+        status = "up" if machine.get("session_exists") else "down"
+        role_bits = []
+        for role in ROLES:
+            state = _role_state(machine, role)
+            token = f"[{state}]"
+            if role == selected_role and index == selected_machine:
+                token = f"<{state}>"
+            role_bits.append(token)
+        line = f"{marker} {machine['label']:<16} {' '.join(role_bits)}  {status:<7} {machine['target']}"
+        _safe_addstr(stdscr, row, x + 1, _clip(line, width - 3), attr)
+        row += 1
+        if row >= y + height - 1:
+            break
+
+
 def _draw_buddy(stdscr: Any, y: int, x: int, height: int, width: int, review: dict[str, str], memory: dict[str, Any], colors: dict[str, int]) -> None:
     _draw_box(stdscr, y, x, height, width, "Hexapus Buddy Rail", colors["accent"])
     row = y + 1
@@ -359,7 +424,7 @@ def _draw_timeline(stdscr: Any, y: int, x: int, height: int, width: int, events:
             break
 
 
-def _collect_snapshot(default_workspace: str, selected_index: int) -> dict[str, Any]:
+def _collect_snapshot(default_workspace: str, selected_index: int, local_session: str, machine_session: str, runtime_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
     missions = sorted(list_missions(), key=lambda item: item.get("updated_at", ""), reverse=True)
     if missions:
         selected_index = max(0, min(selected_index, len(missions) - 1))
@@ -376,6 +441,7 @@ def _collect_snapshot(default_workspace: str, selected_index: int) -> dict[str, 
     decision_lines = _safe_decision_lines(workspace)
     events = _recent_events(selected_mission["mission_id"] if selected_mission else None)
     fleet = load_fleet_config()
+    runtime = runtime_snapshot if runtime_snapshot is not None else _safe_runtime_status(local_session, machine_session)
     return {
         "missions": missions,
         "selected_index": selected_index,
@@ -388,10 +454,11 @@ def _collect_snapshot(default_workspace: str, selected_index: int) -> dict[str, 
         "decision_lines": decision_lines,
         "events": events,
         "fleet_count": len(fleet["machines"]),
+        "runtime": runtime,
     }
 
 
-def _run(stdscr: Any, workspace: str) -> dict[str, Any] | None:
+def _run(stdscr: Any, workspace: str, local_session: str, machine_session: str) -> dict[str, Any] | None:
     try:
         curses.curs_set(0)
     except curses.error:
@@ -400,12 +467,25 @@ def _run(stdscr: Any, workspace: str) -> dict[str, Any] | None:
     stdscr.timeout(250)
     colors = _init_colors()
     selected_index = 0
+    selected_machine = 0
+    selected_role_index = 1
     flash = ""
     flash_until = 0.0
+    runtime_cache: dict[str, Any] | None = None
+    runtime_refresh_at = 0.0
 
     while True:
-        snapshot = _collect_snapshot(workspace, selected_index)
+        now = time.time()
+        if runtime_cache is None or now >= runtime_refresh_at:
+            runtime_cache = _safe_runtime_status(local_session, machine_session)
+            runtime_refresh_at = now + 2.0
+        snapshot = _collect_snapshot(workspace, selected_index, local_session, machine_session, runtime_snapshot=runtime_cache)
         selected_index = snapshot["selected_index"]
+        runtime_machines = snapshot["runtime"].get("machines", [])
+        if runtime_machines:
+            selected_machine = max(0, min(selected_machine, len(runtime_machines) - 1))
+        else:
+            selected_machine = 0
         stdscr.erase()
         height, width = stdscr.getmaxyx()
 
@@ -414,6 +494,7 @@ def _run(stdscr: Any, workspace: str) -> dict[str, Any] | None:
             snapshot["workspace"],
             len(snapshot["missions"]),
             snapshot["fleet_count"],
+            snapshot["runtime"],
             snapshot["memory"],
             snapshot["health"],
             colors,
@@ -425,9 +506,22 @@ def _run(stdscr: Any, workspace: str) -> dict[str, Any] | None:
         left_width = max(28, min(34, width // 4))
         right_width = max(34, min(42, width // 3))
         center_width = max(28, width - left_width - right_width - 4)
+        board_height = max(8, int(main_height * 0.52))
+        runtime_height = max(6, main_height - board_height)
 
         _draw_missions(stdscr, top, 0, main_height, left_width, snapshot["missions"], selected_index, colors)
-        _draw_board(stdscr, top, left_width + 1, main_height, center_width, snapshot["selected_mission"], colors)
+        _draw_board(stdscr, top, left_width + 1, board_height, center_width, snapshot["selected_mission"], colors)
+        _draw_runtime(
+            stdscr,
+            top + board_height,
+            left_width + 1,
+            runtime_height,
+            center_width,
+            snapshot["runtime"],
+            selected_machine,
+            ROLES[selected_role_index],
+            colors,
+        )
         _draw_buddy(stdscr, top, left_width + center_width + 2, main_height, right_width, snapshot["review"], snapshot["memory"], colors)
         _draw_timeline(stdscr, top + main_height, 0, timeline_height, width, snapshot["events"], snapshot["persona_lines"], snapshot["decision_lines"], colors)
 
@@ -435,7 +529,7 @@ def _run(stdscr: Any, workspace: str) -> dict[str, Any] | None:
             _safe_addstr(stdscr, height - 1, 2, _clip(flash, width - 4), colors["warn"])
         else:
             flash = ""
-            _safe_addstr(stdscr, height - 1, 2, "q quit | j/k select mission | z open cockpit | e rebuild memory | s summarize mission", colors["muted"])
+            _safe_addstr(stdscr, height - 1, 2, "q quit | j/k mission | [/] machine | 1..4 pane | o jump | r restart | x capture | z open cockpit", colors["muted"])
 
         stdscr.refresh()
         key = stdscr.getch()
@@ -450,6 +544,60 @@ def _run(stdscr: Any, workspace: str) -> dict[str, Any] | None:
         if key in (ord("k"), curses.KEY_UP):
             if snapshot["missions"]:
                 selected_index = max(0, selected_index - 1)
+            continue
+        if key == ord("["):
+            if snapshot["runtime"]["machines"]:
+                selected_machine = max(0, selected_machine - 1)
+            continue
+        if key == ord("]"):
+            if snapshot["runtime"]["machines"]:
+                selected_machine = min(len(snapshot["runtime"]["machines"]) - 1, selected_machine + 1)
+            continue
+        if key in (ord("1"), ord("2"), ord("3"), ord("4")) and snapshot["runtime"]["machines"]:
+            selected_role_index = int(chr(key)) - 1
+            machine = snapshot["runtime"]["machines"][selected_machine]
+            try:
+                focus_machine(
+                    machine["label"],
+                    ROLES[selected_role_index],
+                    local_session=local_session,
+                    machine_session=machine_session,
+                )
+                runtime_cache = None
+                flash = f"focused {machine['label']}:{ROLES[selected_role_index]}"
+            except Exception as exc:  # noqa: BLE001
+                flash = _error_line("focus failed", exc)
+            flash_until = time.time() + 2.5
+            continue
+        if key == ord("o") and snapshot["runtime"]["machines"]:
+            machine = snapshot["runtime"]["machines"][selected_machine]
+            try:
+                focus_machine(machine["label"], None, local_session=local_session, machine_session=machine_session)
+                runtime_cache = None
+                flash = f"jumped to {machine['label']}"
+            except Exception as exc:  # noqa: BLE001
+                flash = _error_line("jump failed", exc)
+            flash_until = time.time() + 2.5
+            continue
+        if key == ord("r") and snapshot["runtime"]["machines"]:
+            machine = snapshot["runtime"]["machines"][selected_machine]
+            try:
+                restart_pane(machine["label"], ROLES[selected_role_index], machine_session=machine_session)
+                runtime_cache = None
+                flash = f"restarted {machine['label']}:{ROLES[selected_role_index]}"
+            except Exception as exc:  # noqa: BLE001
+                flash = _error_line("restart failed", exc)
+            flash_until = time.time() + 2.5
+            continue
+        if key == ord("x") and snapshot["runtime"]["machines"]:
+            machine = snapshot["runtime"]["machines"][selected_machine]
+            try:
+                capture = capture_pane(machine["label"], ROLES[selected_role_index], lines=12, machine_session=machine_session)
+                preview = (capture.get("stdout") or "").splitlines()[-1:] or ["(empty capture)"]
+                flash = f"{machine['label']}:{ROLES[selected_role_index]} :: {preview[0]}"
+            except Exception as exc:  # noqa: BLE001
+                flash = _error_line("capture failed", exc)
+            flash_until = time.time() + 3.5
             continue
         if key == ord("z"):
             return {"action": "cockpit", "workspace": snapshot["workspace"]}
@@ -471,9 +619,9 @@ def _run(stdscr: Any, workspace: str) -> dict[str, Any] | None:
             continue
 
 
-def run_tui(workspace: str) -> dict[str, Any] | None:
+def run_tui(workspace: str, local_session: str = "constant-fleet", machine_session: str = "constant") -> dict[str, Any] | None:
     try:
         rebuild_workspace_memory(workspace, enroll=True)
     except Exception:
         pass
-    return curses.wrapper(lambda stdscr: _run(stdscr, str(Path(workspace).expanduser().resolve())))
+    return curses.wrapper(lambda stdscr: _run(stdscr, str(Path(workspace).expanduser().resolve()), local_session, machine_session))

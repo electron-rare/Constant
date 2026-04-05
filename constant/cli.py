@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .cockpit import capture_pane, cockpit_doctor, focus_machine, restart_pane, runtime_status, send_to_pane
 from .daemon import daemon_status, request as daemon_request, serve_foreground, start_background, stop_background
 from .executors import bridge_sync, execute_step, fleet_check
 from .memory import (
@@ -110,6 +111,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     health = daemon_request("health", auto_start=False)
     fleet = load_fleet_config()
     models = load_models_config()
+    cockpit = cockpit_doctor()
     report = {
         "version": __version__,
         "repo_root": str(repo_root()),
@@ -122,7 +124,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "codex": _command_exists("codex"),
             "copilot": _command_exists("copilot"),
             "vibe": _command_exists("vibe"),
-            "constant-fleet": (scripts_dir() / "constant-fleet.sh").exists() or (scripts_dir() / "zellij-ai-fleet.sh").exists(),
+            "constant-fleet": (scripts_dir() / "constant-fleet.sh").exists(),
             "ai-bridge": (scripts_dir() / "ai-bridge.sh").exists(),
         },
         "daemon": status,
@@ -130,6 +132,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "health": health,
         "memory": memory_status(),
         "fleet": [{"label": entry["label"], "target": entry["target"]} for entry in fleet["machines"]],
+        "cockpit": cockpit,
     }
     _print(report, args.json)
     return 0
@@ -235,7 +238,7 @@ def cmd_fleet_deploy(args: argparse.Namespace) -> int:
 def cmd_cockpit_open(args: argparse.Namespace) -> int:
     workspace = args.workspace or os.getcwd()
     command = [
-        str((scripts_dir() / "constant-fleet.sh") if (scripts_dir() / "constant-fleet.sh").exists() else (scripts_dir() / "zellij-ai-fleet.sh")),
+        str(scripts_dir() / "constant-fleet.sh"),
         "--workspace",
         workspace,
         "--local-session",
@@ -243,19 +246,81 @@ def cmd_cockpit_open(args: argparse.Namespace) -> int:
         "--session",
         args.session or "constant",
     ]
+    if getattr(args, "recreate", False):
+        command.append("--recreate")
+    if getattr(args, "remote_recreate", False):
+        command.append("--remote-recreate")
     os.execv(command[0], command)
+    return 0
+
+
+def cmd_cockpit_attach(args: argparse.Namespace) -> int:
+    command = [
+        str(scripts_dir() / "constant-fleet.sh"),
+        "--attach-only",
+        "--local-session",
+        args.local_session or "constant-fleet",
+    ]
+    os.execv(command[0], command)
+    return 0
+
+
+def cmd_cockpit_doctor(args: argparse.Namespace) -> int:
+    payload = cockpit_doctor(local_session=args.local_session or "constant-fleet", machine_session=args.session or "constant")
+    _print(payload, args.json)
+    return 0 if payload["tmux"]["available"] else 1
+
+
+def cmd_cockpit_focus(args: argparse.Namespace) -> int:
+    payload = focus_machine(
+        args.machine,
+        args.pane,
+        local_session=args.local_session or "constant-fleet",
+        machine_session=args.session or "constant",
+    )
+    _print(payload, args.json)
+    return 0 if payload["returncode"] == 0 else 1
+
+
+def cmd_cockpit_send(args: argparse.Namespace) -> int:
+    payload = send_to_pane(args.machine, args.pane, args.command, machine_session=args.session or "constant")
+    _print(payload, args.json)
+    return 0 if payload["returncode"] == 0 else 1
+
+
+def cmd_cockpit_capture(args: argparse.Namespace) -> int:
+    payload = capture_pane(args.machine, args.pane, lines=args.lines, machine_session=args.session or "constant")
+    _print(payload if args.json else payload.get("stdout", ""), args.json)
+    return 0 if payload["returncode"] == 0 else 1
+
+
+def cmd_cockpit_restart(args: argparse.Namespace) -> int:
+    payload = restart_pane(args.machine, args.pane, machine_session=args.session or "constant")
+    _print(payload, args.json)
+    return 0 if payload["returncode"] == 0 else 1
+
+
+def cmd_cockpit_status(args: argparse.Namespace) -> int:
+    payload = runtime_status(local_session=args.local_session or "constant-fleet", machine_session=args.session or "constant")
+    _print(payload, args.json)
     return 0
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
     workspace = str(Path(args.workspace or os.getcwd()).expanduser().resolve())
-    action = run_tui(workspace)
+    action = run_tui(
+        workspace,
+        local_session=args.local_session or "constant-fleet",
+        machine_session=args.session or "constant",
+    )
     if action and action.get("action") == "cockpit":
         return cmd_cockpit_open(
             argparse.Namespace(
                 workspace=action.get("workspace", workspace),
                 local_session=args.local_session,
                 session=args.session,
+                recreate=False,
+                remote_recreate=False,
             )
         )
     return 0
@@ -560,7 +625,49 @@ def build_parser() -> argparse.ArgumentParser:
     cockpit_open.add_argument("--workspace")
     cockpit_open.add_argument("--local-session")
     cockpit_open.add_argument("--session")
+    cockpit_open.add_argument("--recreate", action="store_true")
+    cockpit_open.add_argument("--remote-recreate", action="store_true")
     cockpit_open.set_defaults(func=cmd_cockpit_open)
+    cockpit_attach = cockpit_sub.add_parser("attach")
+    cockpit_attach.add_argument("--local-session")
+    cockpit_attach.set_defaults(func=cmd_cockpit_attach)
+    cockpit_doctor_cmd = cockpit_sub.add_parser("doctor")
+    cockpit_doctor_cmd.add_argument("--local-session")
+    cockpit_doctor_cmd.add_argument("--session")
+    cockpit_doctor_cmd.add_argument("--json", action="store_true")
+    cockpit_doctor_cmd.set_defaults(func=cmd_cockpit_doctor)
+    cockpit_status_cmd = cockpit_sub.add_parser("status")
+    cockpit_status_cmd.add_argument("--local-session")
+    cockpit_status_cmd.add_argument("--session")
+    cockpit_status_cmd.add_argument("--json", action="store_true")
+    cockpit_status_cmd.set_defaults(func=cmd_cockpit_status)
+    cockpit_focus_cmd = cockpit_sub.add_parser("focus")
+    cockpit_focus_cmd.add_argument("--machine", required=True)
+    cockpit_focus_cmd.add_argument("--pane")
+    cockpit_focus_cmd.add_argument("--local-session")
+    cockpit_focus_cmd.add_argument("--session")
+    cockpit_focus_cmd.add_argument("--json", action="store_true")
+    cockpit_focus_cmd.set_defaults(func=cmd_cockpit_focus)
+    cockpit_send_cmd = cockpit_sub.add_parser("send")
+    cockpit_send_cmd.add_argument("--machine", required=True)
+    cockpit_send_cmd.add_argument("--pane", required=True)
+    cockpit_send_cmd.add_argument("--command", required=True)
+    cockpit_send_cmd.add_argument("--session")
+    cockpit_send_cmd.add_argument("--json", action="store_true")
+    cockpit_send_cmd.set_defaults(func=cmd_cockpit_send)
+    cockpit_capture_cmd = cockpit_sub.add_parser("capture")
+    cockpit_capture_cmd.add_argument("--machine", required=True)
+    cockpit_capture_cmd.add_argument("--pane", required=True)
+    cockpit_capture_cmd.add_argument("--lines", type=int, default=120)
+    cockpit_capture_cmd.add_argument("--session")
+    cockpit_capture_cmd.add_argument("--json", action="store_true")
+    cockpit_capture_cmd.set_defaults(func=cmd_cockpit_capture)
+    cockpit_restart_cmd = cockpit_sub.add_parser("restart")
+    cockpit_restart_cmd.add_argument("--machine", required=True)
+    cockpit_restart_cmd.add_argument("--pane", required=True)
+    cockpit_restart_cmd.add_argument("--session")
+    cockpit_restart_cmd.add_argument("--json", action="store_true")
+    cockpit_restart_cmd.set_defaults(func=cmd_cockpit_restart)
 
     mission = subparsers.add_parser("mission")
     mission_sub = mission.add_subparsers(dest="mission_command", required=True)

@@ -8,35 +8,35 @@
       "target": "local",
       "auto_clis": ["codex", "vibe", "claude"],
       "manual_clis": ["copilot"],
-      "backends": ["omc", "cli-local", "zellij"]
+      "backends": ["omc", "cli-local", "cockpit"]
     },
     {
       "label": "builder-a",
       "target": "dev@builder-a",
       "auto_clis": ["codex", "vibe", "claude"],
       "manual_clis": ["copilot"],
-      "backends": ["cli-ssh", "zellij"]
+      "backends": ["cli-ssh", "cockpit"]
     },
     {
       "label": "builder-b",
       "target": "dev@builder-b",
       "auto_clis": ["codex", "vibe", "claude"],
       "manual_clis": ["copilot"],
-      "backends": ["cli-ssh", "zellij"]
+      "backends": ["cli-ssh", "cockpit"]
     },
     {
       "label": "edge-a",
       "target": "dev@edge-a",
       "auto_clis": ["codex", "vibe", "claude"],
       "manual_clis": ["copilot"],
-      "backends": ["cli-ssh", "zellij"]
+      "backends": ["cli-ssh", "cockpit"]
     },
     {
       "label": "lab-a",
       "target": "dev@lab-a",
       "auto_clis": ["codex", "vibe", "claude"],
       "manual_clis": ["copilot"],
-      "backends": ["cli-ssh", "zellij"]
+      "backends": ["cli-ssh", "cockpit"]
     }
   ]
 }

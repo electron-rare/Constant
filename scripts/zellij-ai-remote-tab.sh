@@ -8,22 +8,23 @@ while [[ -L "$script_source" ]]; do
     [[ "$script_source" != /* ]] && script_source="$script_dir/$script_source"
 done
 script_dir="$(cd "$(dirname "$script_source")" && pwd -P)"
-source "$script_dir/zellij-ai-common.sh"
+source "$script_dir/constant-common.sh"
 
 warn_deprecated() {
     printf 'Warning: %s\n' "$*" >&2
 }
 
 usage() {
-    cat <<'EOF'
-Usage: zellij-ai-remote-tab.sh [options]
+    local script_name="${CONSTANT_SCRIPT_NAME:-$(basename "$0")}"
+    cat <<EOF
+Usage: ${script_name} [options]
 
-Open or attach the local AI Zellij session for one machine.
+Open or attach the local Constant machine session for one machine.
 
 Options:
   --label NAME         Display label for logs and tab naming
   --target TARGET      SSH target, or "local" for the current machine
-  --session NAME       Remote/local Zellij session name
+  --session NAME       Remote/local Constant tmux session name
                        default: constant
   --repo-dir DIR       Repository path on the target machine
                        default: $HOME/constant

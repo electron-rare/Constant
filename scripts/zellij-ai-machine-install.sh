@@ -8,8 +8,8 @@ while [[ -L "$script_source" ]]; do
     [[ "$script_source" != /* ]] && script_source="$script_dir/$script_source"
 done
 script_dir="$(cd "$(dirname "$script_source")" && pwd -P)"
-if [[ -f "$script_dir/zellij-ai-common.sh" ]]; then
-    source "$script_dir/zellij-ai-common.sh"
+if [[ -f "$script_dir/constant-common.sh" ]]; then
+    source "$script_dir/constant-common.sh"
 else
     zellij_ai_default_repo_dir() {
         printf '%s\n' '$HOME/constant'
@@ -273,7 +273,7 @@ run_check() {
     print_status repo_dir "$repo_dir"
     print_status codex_home "$codex_home"
 
-    for binary in bash git zellij node npm uv claude codex copilot vibe; do
+    for binary in bash git tmux node npm uv claude codex copilot vibe; do
         if command -v "$binary" >/dev/null 2>&1; then
             print_status "$binary" "$(command -v "$binary")"
         else
@@ -310,7 +310,7 @@ run_check() {
 
 install_darwin() {
     ensure_homebrew
-    brew install git zellij node uv
+    brew install git tmux node uv
 }
 
 install_linux_ubuntu() {
@@ -325,12 +325,8 @@ install_linux_ubuntu() {
         run_root apt-get install -y npm
     fi
 
-    if ! command -v zellij >/dev/null 2>&1; then
-        if command -v snap >/dev/null 2>&1; then
-            run_root snap install zellij --classic
-        else
-            run_root apt-get install -y zellij
-        fi
+    if ! command -v tmux >/dev/null 2>&1; then
+        run_root apt-get install -y tmux
     fi
 }
 
@@ -354,8 +350,14 @@ install_linux_photon() {
         run_root tdnf install -y "${packages[@]}"
     fi
 
-    if ! command -v zellij >/dev/null 2>&1; then
-        fail "zellij is missing on Photon OS and no native install path is scripted here."
+    if ! command -v tmux >/dev/null 2>&1; then
+        if command -v tdnf >/dev/null 2>&1; then
+            run_root tdnf install -y tmux
+        fi
+    fi
+
+    if ! command -v tmux >/dev/null 2>&1; then
+        fail "tmux is missing on Photon OS and no native install path is scripted here."
     fi
 }
 

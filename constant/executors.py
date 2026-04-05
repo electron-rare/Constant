@@ -74,8 +74,8 @@ def execute_step(step: dict[str, Any], mission: dict[str, Any], fleet: dict[str,
             "duration_s": 0.0,
         }
 
-    if backend == "zellij":
-        cockpit = str((scripts_dir() / "constant-fleet.sh") if (scripts_dir() / "constant-fleet.sh").exists() else (scripts_dir() / "zellij-ai-fleet.sh"))
+    if backend in {"zellij", "cockpit"}:
+        cockpit = str(scripts_dir() / "constant-fleet.sh")
         return {
             "argv": [cockpit, "--workspace", workspace],
             "returncode": 0,
@@ -99,8 +99,6 @@ def execute_step(step: dict[str, Any], mission: dict[str, Any], fleet: dict[str,
 
 def fleet_check() -> dict[str, Any]:
     check_script = repo_root() / "scripts" / "constant-fleet-install.sh"
-    if not check_script.exists():
-        check_script = repo_root() / "scripts" / "zellij-ai-fleet-install.sh"
     process = subprocess.run([str(check_script), "check"], capture_output=True, text=True)
 
     machines: list[dict[str, Any]] = []
