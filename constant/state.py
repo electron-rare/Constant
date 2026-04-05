@@ -24,6 +24,7 @@ from .paths import (
 DEFAULT_FLEET: dict[str, Any] = {
     "version": 1,
     "local_machine": "command-center",
+    "repo_dir": "$HOME/constant",
     "machines": [
         {
             "label": "command-center",

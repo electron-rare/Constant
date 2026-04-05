@@ -113,6 +113,7 @@ That gives you:
 - verification
 - delegation
 - cockpit handoff
+- SSH discovery and fleet deployment bootstrap
 
 ### 4. Durable memory
 
@@ -187,6 +188,9 @@ codex login --device-auth
 ./scripts/Constant memory rebuild --workspace "$PWD"
 ./scripts/Constant memory search "buddy rail" --workspace "$PWD"
 ./scripts/Constant cockpit open --workspace "$PWD"
+./scripts/Constant fleet discover --json
+./scripts/Constant fleet configure
+./scripts/Constant fleet deploy
 ```
 
 If `Constant` is on your `PATH`, you can also just run:
@@ -196,6 +200,51 @@ Constant
 ```
 
 In interactive mode, `Constant` with no arguments now opens the TUI by default.
+
+### Discover and deploy a fleet
+
+`Constant` now ships with a public discovery/deployment CLI that:
+
+- scans `~/.ssh/config`
+- scans `~/.ssh/known_hosts`
+- scans local `arp -a` neighbors
+- validates candidates with a short SSH probe
+- lets you select targets interactively
+- asks for SSH user and machine labels
+- writes `~/.config/constant/fleet.json`
+- can immediately deploy the runtime to the selected machines
+
+Examples:
+
+```bash
+./scripts/constant-deploy.sh scan --json
+./scripts/constant-deploy.sh configure
+./scripts/constant-deploy.sh deploy
+
+Constant fleet discover --json
+Constant fleet configure --host dev@builder-a --host dev@edge-a
+Constant fleet deploy --repo-dir '$HOME/constant'
+```
+
+You can pass raw SSH seeds such as:
+
+- `dev@builder-a`
+- `root@192.168.0.119`
+- `lab-a`
+
+If a `fleet.json` contains `repo_dir`, the shell launchers and fleet installer will reuse it automatically.
+
+For a fully non-interactive run, pass explicit hosts and `--yes`:
+
+```bash
+Constant fleet configure \
+  --host builder-a \
+  --host builder-b \
+  --user dev \
+  --repo-dir '$HOME/constant' \
+  --local-label command-center \
+  --yes
+```
 
 ### TUI keys
 
@@ -245,6 +294,7 @@ cp examples/fleet.example.json ~/.config/constant/fleet.json
 ```
 
 Legacy `~/.config/constant/fleet.yaml` is still read for compatibility, but the public-facing format is now JSON.
+The shell launchers also read `fleet.json` now, so fleet tabs, install/check, and bridge helpers stay aligned with the same config.
 
 ## Messaging
 
@@ -326,6 +376,7 @@ Planned layers for the public `Constant` repo:
 constant/                         Python orchestration core
 examples/fleet.example.json       public fleet template
 scripts/Constant                  canonical CLI entrypoint
+scripts/constant-deploy.sh        discovery + selection + fleet deployment CLI
 scripts/constant-machine.sh       canonical single-machine cockpit entrypoint
 scripts/constant-fleet.sh         canonical fleet cockpit entrypoint
 scripts/constant-fleet-install.sh canonical fleet installer/checker

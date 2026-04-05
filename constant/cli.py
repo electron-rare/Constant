@@ -187,6 +187,51 @@ def cmd_fleet_sync(args: argparse.Namespace) -> int:
     return 0 if payload["returncode"] == 0 else 1
 
 
+def _exec_fleet_deploy_script(mode: str, args: argparse.Namespace) -> int:
+    script = scripts_dir() / "constant-deploy.sh"
+    command = [str(script), mode]
+
+    for host in args.host or []:
+        command.extend(["--host", host])
+    if args.user:
+        command.extend(["--user", args.user])
+    if args.repo_dir:
+        command.extend(["--repo-dir", args.repo_dir])
+    if args.local_label:
+        command.extend(["--local-label", args.local_label])
+    if args.output:
+        command.extend(["--output", args.output])
+    if getattr(args, "json", False):
+        command.append("--json")
+    if getattr(args, "yes", False):
+        command.append("--yes")
+    if getattr(args, "all_reachable", False):
+        command.append("--all-reachable")
+    if getattr(args, "install", False):
+        command.append("--install")
+    if getattr(args, "no_ssh_config", False):
+        command.append("--no-ssh-config")
+    if getattr(args, "no_known_hosts", False):
+        command.append("--no-known-hosts")
+    if getattr(args, "no_arp", False):
+        command.append("--no-arp")
+
+    os.execv(command[0], command)
+    return 0
+
+
+def cmd_fleet_discover(args: argparse.Namespace) -> int:
+    return _exec_fleet_deploy_script("scan", args)
+
+
+def cmd_fleet_configure(args: argparse.Namespace) -> int:
+    return _exec_fleet_deploy_script("configure", args)
+
+
+def cmd_fleet_deploy(args: argparse.Namespace) -> int:
+    return _exec_fleet_deploy_script("deploy", args)
+
+
 def cmd_cockpit_open(args: argparse.Namespace) -> int:
     workspace = args.workspace or os.getcwd()
     command = [
@@ -487,6 +532,27 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_sync_cmd = fleet_sub.add_parser("sync")
     fleet_sync_cmd.add_argument("--json", action="store_true")
     fleet_sync_cmd.set_defaults(func=cmd_fleet_sync)
+    for fleet_cmd_name, fleet_cmd_func, allow_json in (
+        ("discover", cmd_fleet_discover, True),
+        ("configure", cmd_fleet_configure, False),
+        ("deploy", cmd_fleet_deploy, False),
+    ):
+        fleet_cmd = fleet_sub.add_parser(fleet_cmd_name)
+        fleet_cmd.add_argument("--host", action="append")
+        fleet_cmd.add_argument("--user")
+        fleet_cmd.add_argument("--repo-dir")
+        fleet_cmd.add_argument("--local-label")
+        fleet_cmd.add_argument("--output")
+        fleet_cmd.add_argument("--yes", action="store_true")
+        fleet_cmd.add_argument("--all-reachable", action="store_true")
+        fleet_cmd.add_argument("--no-ssh-config", action="store_true")
+        fleet_cmd.add_argument("--no-known-hosts", action="store_true")
+        fleet_cmd.add_argument("--no-arp", action="store_true")
+        if fleet_cmd_name == "configure":
+            fleet_cmd.add_argument("--install", action="store_true")
+        if allow_json:
+            fleet_cmd.add_argument("--json", action="store_true")
+        fleet_cmd.set_defaults(func=fleet_cmd_func)
 
     cockpit = subparsers.add_parser("cockpit")
     cockpit_sub = cockpit.add_subparsers(dest="cockpit_command", required=True)

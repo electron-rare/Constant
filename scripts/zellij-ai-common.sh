@@ -1,5 +1,74 @@
 #!/usr/bin/env bash
 
+zellij_ai_config_root() {
+    printf '%s\n' "${CONSTANT_CONFIG_ROOT:-$HOME/.config/constant}"
+}
+
+zellij_ai_fleet_config_candidates() {
+    if [[ -n "${CONSTANT_FLEET_CONFIG:-}" ]]; then
+        printf '%s\n' "$CONSTANT_FLEET_CONFIG"
+    fi
+    printf '%s\n' "$(zellij_ai_config_root)/fleet.json"
+    printf '%s\n' "$(zellij_ai_config_root)/fleet.yaml"
+}
+
+zellij_ai_fleet_config_path() {
+    local candidate
+    while IFS= read -r candidate; do
+        [[ -z "$candidate" ]] && continue
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(zellij_ai_fleet_config_candidates)
+    return 1
+}
+
+zellij_ai_fleet_config_query() {
+    local expr="$1"
+    local config_path
+
+    config_path="$(zellij_ai_fleet_config_path 2>/dev/null || true)"
+    [[ -n "$config_path" ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+
+    python3 - "$config_path" "$expr" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expr = sys.argv[2]
+
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+
+if expr == "repo_dir":
+    value = payload.get("repo_dir")
+    if isinstance(value, str) and value:
+        print(value)
+    raise SystemExit(0)
+
+if expr == "local_machine":
+    value = payload.get("local_machine")
+    if isinstance(value, str) and value:
+        print(value)
+    raise SystemExit(0)
+
+if expr == "machine_specs":
+    for machine in payload.get("machines", []):
+        label = machine.get("label")
+        target = machine.get("target")
+        if isinstance(label, str) and label and isinstance(target, str) and target:
+            print(f"{label}={target}")
+    raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
 zellij_ai_default_session() {
     printf '%s\n' "constant"
 }
@@ -9,7 +78,13 @@ zellij_ai_default_local_session() {
 }
 
 zellij_ai_default_repo_dir() {
-    printf '%s\n' '$HOME/constant'
+    local configured
+    configured="$(zellij_ai_fleet_config_query repo_dir 2>/dev/null || true)"
+    if [[ -n "$configured" ]]; then
+        printf '%s\n' "$configured"
+    else
+        printf '%s\n' '$HOME/constant'
+    fi
 }
 
 zellij_ai_default_codex_home() {
@@ -37,6 +112,13 @@ zellij_ai_bridge_cache_dir() {
 }
 
 zellij_ai_default_machine_specs() {
+    local configured
+    configured="$(zellij_ai_fleet_config_query machine_specs 2>/dev/null || true)"
+    if [[ -n "$configured" ]]; then
+        printf '%s\n' "$configured"
+        return 0
+    fi
+
     cat <<'EOF'
 command-center=local
 builder-a=dev@builder-a
@@ -168,7 +250,13 @@ zellij_ai_current_machine_name() {
 }
 
 zellij_ai_local_machine_label() {
-    printf '%s\n' "command-center"
+    local configured
+    configured="$(zellij_ai_fleet_config_query local_machine 2>/dev/null || true)"
+    if [[ -n "$configured" ]]; then
+        printf '%s\n' "$configured"
+    else
+        printf '%s\n' "command-center"
+    fi
 }
 
 zellij_ai_agent_path() {

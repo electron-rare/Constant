@@ -1,6 +1,7 @@
 {
   "version": 1,
   "local_machine": "command-center",
+  "repo_dir": "$HOME/constant",
   "machines": [
     {
       "label": "command-center",
