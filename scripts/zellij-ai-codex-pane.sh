@@ -66,6 +66,12 @@ workspace="${ZELLIJ_AI_WORKSPACE:-$PWD}"
 image="${ZELLIJ_AI_CODEX_IMAGE:-codercom/code-server:latest}"
 main_codex_config="${ZELLIJ_AI_MAIN_CODEX_CONFIG:-$HOME/.codex/config.toml}"
 codex_binary="$(find_codex_binary || true)"
+term_value="${ZELLIJ_AI_CODEX_TERM:-${TERM:-xterm-256color}}"
+color_term_value="${COLORTERM:-truecolor}"
+
+if [[ "$term_value" == "dumb" ]]; then
+    term_value="xterm-256color"
+fi
 
 if [[ ! -d "$workspace" ]]; then
     echo "Workspace not found: $workspace" >&2
@@ -136,8 +142,8 @@ docker_args=(
     -e HOME=/codex-home
     -e CODEX_HOME=/codex-home
     -e USER="${USER:-$(id -un)}"
-    -e TERM="${TERM:-xterm-256color}"
-    -e COLORTERM="${COLORTERM:-truecolor}"
+    -e TERM="$term_value"
+    -e COLORTERM="$color_term_value"
     -e LANG="${LANG:-C.UTF-8}"
     -v "${workspace}:/workspace"
     -v "${profile_dir}:/codex-home"

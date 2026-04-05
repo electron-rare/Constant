@@ -38,6 +38,15 @@ Useful flags:
   --recreate
 ```
 
+By default, the launcher creates a fresh temporary Zellij config directory for each new session.
+This is intentional: it avoids interference from an existing user Zellij config, custom default
+layouts, plugins, or resurrected session state. If you really want to use a specific Zellij config
+directory, pass:
+
+```bash
+./scripts/zellij-ai-triple.sh --zellij-config-dir /path/to/zellij-config
+```
+
 On first launch of each Codex pane, if `auth.json` is missing in its profile, the pane runs:
 
 ```bash

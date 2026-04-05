@@ -29,6 +29,9 @@ Options:
   --codex2-label LABEL  Display label for the second Codex pane
                         default: codex-2
   --claude-config DIR   Optional CLAUDE_CONFIG_DIR override for the Claude pane
+  --zellij-config-dir DIR
+                        Optional isolated Zellij config dir to use for session creation
+                        default: a fresh temporary config dir per new session
   --recreate            Kill the existing session before recreating it
   -h, --help            Show this help
 EOF
@@ -54,6 +57,7 @@ codex2_home="$HOME/.codex-profiles/codex-2"
 codex1_label="codex-1"
 codex2_label="codex-2"
 claude_config_dir=""
+zellij_config_dir=""
 recreate=false
 
 while [[ $# -gt 0 ]]; do
@@ -88,6 +92,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --claude-config)
             claude_config_dir="$2"
+            shift 2
+            ;;
+        --zellij-config-dir)
+            zellij_config_dir="$2"
             shift 2
             ;;
         --recreate)
@@ -156,14 +164,22 @@ rm -f "$bootstrap_file"
 bootstrap_path="$(kdl_escape "$script_dir/zellij-ai-bootstrap.sh")"
 cat >"$layout_file" <<EOF
 layout {
-    pane size=1 borderless=true {
-        plugin location="tab-bar"
-    }
-    pane command="$bootstrap_path"
-    pane size=2 borderless=true {
-        plugin location="status-bar"
+    tab name="AI Triple" {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        pane command="$bootstrap_path"
+        pane size=2 borderless=true {
+            plugin location="status-bar"
+        }
     }
 }
 EOF
 
-exec zellij --new-session-with-layout "$layout_file" --session "$session"
+if [[ -z "$zellij_config_dir" ]]; then
+    zellij_config_dir="$(mktemp -d "${TMPDIR:-/tmp}/zellij-ai-triple-${session}.XXXXXX")"
+else
+    mkdir -p "$zellij_config_dir"
+fi
+
+exec zellij --config-dir "$zellij_config_dir" --new-session-with-layout "$layout_file" --session "$session"
