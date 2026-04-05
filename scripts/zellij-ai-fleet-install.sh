@@ -180,17 +180,13 @@ for machine_spec in "${machines[@]}"; do
         continue
     fi
 
+    remote_script="${target_repo_dir}/scripts/constant-machine-install.sh"
     if [[ "$mode" == "install" ]]; then
-        remote_script="${target_repo_dir}/scripts/constant-machine-install.sh"
         ssh -tt "$target" env ZELLIJ_AI_MACHINE_NAME="$label" "$remote_script" "${install_args[@]}" || overall_status=1
         continue
     fi
 
-    if $yes; then
-        ssh "$target" env ZELLIJ_AI_MACHINE_NAME="$label" bash -s -- "${install_args[@]}" <"$script_dir/constant-machine-install.sh" || overall_status=1
-    else
-        ssh "$target" env ZELLIJ_AI_MACHINE_NAME="$label" bash -s -- "${install_args[@]}" <"$script_dir/constant-machine-install.sh" || overall_status=1
-    fi
+    ssh "$target" env ZELLIJ_AI_MACHINE_NAME="$label" "$remote_script" "${install_args[@]}" || overall_status=1
 done
 
 exit "$overall_status"
