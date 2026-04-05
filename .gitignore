@@ -4,6 +4,8 @@
 .cache/
 .tmp/
 tmp/
+__pycache__/
+*.pyc
 *.log
 *.pem
 *.key
@@ -13,6 +15,7 @@ tmp/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+output/
 codex-profiles/
 profiles/
 state/
