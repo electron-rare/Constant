@@ -151,12 +151,14 @@ if [[ -n "$claude_config_dir" ]]; then
 fi
 
 if $recreate && session_exists "$session"; then
-    zellij kill-session "$session" >/dev/null 2>&1 || true
+    zellij delete-session -f "$session" >/dev/null 2>&1 || true
 fi
 
 if session_exists "$session"; then
     exec zellij attach "$session"
 fi
+
+zellij delete-session "$session" >/dev/null 2>&1 || true
 
 mkdir -p "$(dirname "$bootstrap_file")"
 rm -f "$bootstrap_file"
