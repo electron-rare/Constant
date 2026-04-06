@@ -21,6 +21,19 @@ slot:
 EOF
 }
 
+shell_fallback() {
+    local reason="${1:-Codex pane ended.}"
+    local shell_bin="${SHELL:-/bin/bash}"
+    echo
+    echo "$reason"
+    echo "Keeping the pane alive in an interactive shell."
+    echo "Workspace: $workspace"
+    echo "CODEX_HOME: $CODEX_HOME"
+    echo "You can retry manually with: codex login --device-auth"
+    echo
+    exec "$shell_bin" -il
+}
+
 warn_deprecated() {
     printf 'Warning: %s\n' "$*" >&2
 }
@@ -105,8 +118,18 @@ if [[ ! -f "$CODEX_HOME/auth.json" ]]; then
     echo "No auth.json found for $label."
     echo "Starting: codex login --device-auth"
     echo
-    codex login --device-auth
+    if ! codex login --device-auth; then
+        echo
+        echo "Codex login did not complete successfully."
+    fi
     echo
 fi
 
-exec codex --no-alt-screen -C "$workspace"
+if [[ ! -f "$CODEX_HOME/auth.json" ]]; then
+    shell_fallback "Codex auth is still missing."
+fi
+
+if ! codex --no-alt-screen -C "$workspace"; then
+    rc=$?
+    shell_fallback "Codex exited with status ${rc}."
+fi

@@ -8,6 +8,48 @@ while [[ -L "$script_source" ]]; do
     [[ "$script_source" != /* ]] && script_source="$script_dir/$script_source"
 done
 script_dir="$(cd "$(dirname "$script_source")" && pwd -P)"
+source "$script_dir/constant-common.sh"
 
-export CONSTANT_SCRIPT_NAME="${CONSTANT_SCRIPT_NAME:-$(basename "$0")}"
-exec "$script_dir/zellij-ai-vibe-pane.sh" "$@"
+workspace="${ZELLIJ_AI_WORKSPACE:-$PWD}"
+machine_name="${ZELLIJ_AI_MACHINE_NAME:-unknown}"
+session_name="${ZELLIJ_AI_SESSION:-$(zellij_ai_default_session)}"
+repo_dir="${ZELLIJ_AI_REPO_DIR:-$(cd "$script_dir/.." && pwd -P)}"
+bus_dir="${ZELLIJ_AI_BUS_DIR:-$(zellij_ai_session_state_dir "$session_name")/bus}"
+label="${ZELLIJ_AI_VIBE_LABEL:-vibe}"
+
+if [[ ! -d "$workspace" ]]; then
+    echo "Workspace not found: $workspace" >&2
+    exit 1
+fi
+
+export PATH="$(zellij_ai_agent_path)"
+
+if [[ -n "$repo_dir" && -d "$repo_dir/scripts" ]]; then
+    export PATH="$repo_dir/scripts:$PATH"
+fi
+
+if ! command -v vibe >/dev/null 2>&1; then
+    echo "Mistral Vibe CLI not found on the host." >&2
+    echo "Install it with: uv tool install mistral-vibe" >&2
+    exit 1
+fi
+
+mkdir -p "$bus_dir/messages"
+
+export ZELLIJ_AI_ROLE="$label"
+export ZELLIJ_AI_MACHINE_NAME="$machine_name"
+export ZELLIJ_AI_SESSION="$session_name"
+export ZELLIJ_AI_BUS_DIR="$bus_dir"
+
+cd "$workspace"
+
+echo "Vibe pane"
+echo "machine: $machine_name"
+echo "workspace: $workspace"
+echo "bus: $bus_dir"
+if [[ -n "$repo_dir" ]]; then
+    echo "helper: $repo_dir/scripts/ai-msg.sh"
+fi
+echo
+
+exec vibe

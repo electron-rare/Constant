@@ -4,13 +4,139 @@ import curses
 import json
 import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .capabilities import list_skills
 from .cockpit import ROLES, capture_pane, focus_machine, restart_pane, runtime_status
 from .daemon import request as daemon_request
 from .memory import list_decisions, memory_status, persona_markdown, prime_workspace_memory, rebuild_workspace_memory, summarize_mission
-from .state import list_missions, load_fleet_config, mission_events_file
+from .state import (
+    append_chat_message,
+    append_event,
+    create_mission,
+    list_missions,
+    load_fleet_config,
+    mission_events_file,
+    read_chat_history,
+    save_mission,
+)
+
+
+CHAT_LABELS = {
+    "user": "YOU",
+    "constant": "CONSTANT",
+    "buddy": "BUDDY",
+    "system": "SYSTEM",
+}
+
+HEXAPUS_FRAMES = (
+    [
+        "         .-====-.",
+        "      .-'  .--.  `-.",
+        "     /    ( oo )    \\",
+        "    |      \\/\\/      |",
+        "    |    .-____-.    |",
+        "     \\__/_/ || \\_\\__/",
+        "       /_  /||\\  _\\",
+        "    .-'  \\/ || \\/  `-.",
+        "   <_____/  ||  \\_____>",
+        "        /___/\\___\\",
+    ],
+    [
+        "         .-====-.",
+        "      .-'  .--.  `-.",
+        "     /    ( oo )    \\",
+        "    |      \\/\\/      |",
+        "    |    .-____-.    |",
+        "   _/\\__/ / || \\ \\__/\\_",
+        "  /_  _\\/  ||  \\/_  _\\",
+        "    `-.   / || \\   .-'",
+        "   <_____/  ||  \\_____>",
+        "        /___/\\___\\",
+    ],
+    [
+        "         .-====-.",
+        "      .-'  .--.  `-.",
+        "     /    ( -- )    \\",
+        "    |      \\/\\/      |",
+        "    |    .-____-.    |",
+        "     \\__/_/ || \\_\\__/",
+        "       /_  /||\\  _\\",
+        "   .--'  \\/ || \\/  `--.",
+        "  <_____/   ||   \\_____>",
+        "        /___/\\___\\",
+    ],
+    [
+        "         .-====-.",
+        "      .-'  .--.  `-.",
+        "     /    ( oo )    \\",
+        "    |      \\/\\/      |",
+        "    |    .-____-.    |",
+        "  _/\\__/_/ || \\_\\__ /\\_",
+        " /_  _/   /||\\   \\_  _\\",
+        "   `-.   / || \\   .-'",
+        "  <_____/  ||  \\_____>",
+        "       /___/\\___\\",
+    ],
+    [
+        "         .-====-.",
+        "      .-'  .--.  `-.",
+        "     /    ( xx )    \\",
+        "    |      \\/\\/      |",
+        "    |    .-____-.    |",
+        "     \\__/__/||\\__\\__/",
+        "       _\\_ /||\\ _/_",
+        "   .--'   \\/ || \\/   `--.",
+        "  <_____/   ||   \\_____>",
+        "        /___/\\___\\",
+    ],
+)
+
+
+@dataclass
+class TuiLayout:
+    height: int
+    width: int
+    top: int
+    footer_height: int
+    timeline_height: int
+    main_height: int
+    left_width: int
+    right_width: int
+    center_width: int
+    conversation_height: int
+    runtime_height: int
+
+
+@dataclass
+class TuiState:
+    selected_index: int = 0
+    selected_machine: int = 0
+    selected_role_index: int = 1
+    flash: str = ""
+    flash_until: float = 0.0
+    runtime_cache: dict[str, Any] | None = None
+    runtime_refresh_at: float = 0.0
+    input_mode: bool = True
+    input_buffer: str = ""
+    slash_menu_index: int = 0
+    capture_state: dict[str, Any] | None = None
+    pending_select_mission_id: str | None = None
+    chat_focus: bool = True
+    stream_text: str = ""
+    stream_started_at: float = 0.0
+    stream_duration: float = 0.0
+    stream_mission_id: str | None = None
+
+    @property
+    def selected_role(self) -> str:
+        return ROLES[self.selected_role_index]
+
+    def set_flash(self, message: str, duration: float = 2.5) -> None:
+        self.flash = message
+        self.flash_until = time.time() + duration
 
 
 def _error_line(prefix: str, exc: Exception) -> str:
@@ -56,6 +182,8 @@ def _safe_runtime_status(local_session: str, machine_session: str) -> dict[str, 
             "machines": [],
             "fleet_windows": [],
             "fleet_stderr": _error_line("cockpit", exc),
+            "focused_machine": None,
+            "focused_role": None,
         }
 
 
@@ -167,23 +295,29 @@ def _normalize_buddy(review: dict[str, Any] | None) -> dict[str, str]:
     }
 
 
-def _hexapus_lines() -> list[str]:
-    return [
-        "         .-====-.",
-        "      .-'  .--.  `-.",
-        "     /    ( oo )    \\",
-        "    |      \\/\\/      |",
-        "    |    .-____-.    |",
-        "     \\__/_/ || \\_\\__/",
-        "       /_  /||\\  _\\",
-        "    .-'  \\/ || \\/  `-.",
-        "   <_____/  ||  \\_____>",
-        "        /___/\\___\\",
-    ]
+def _hexapus_lines(verdict: str, tick: int) -> list[str]:
+    if verdict in {"block", "failed"}:
+        return HEXAPUS_FRAMES[4]
+    if verdict == "reroute":
+        return HEXAPUS_FRAMES[tick % 4]
+    if verdict == "warn":
+        return HEXAPUS_FRAMES[(tick // 2) % 4]
+    return HEXAPUS_FRAMES[(tick // 3) % 2]
 
 
 def _init_colors() -> dict[str, int]:
-    palette = {"base": 0, "accent": 0, "muted": 0, "warn": 0, "good": 0, "bad": 0, "hot": 0}
+    palette = {
+        "base": 0,
+        "accent": 0,
+        "muted": 0,
+        "warn": 0,
+        "good": 0,
+        "bad": 0,
+        "hot": 0,
+        "user": 0,
+        "system": 0,
+        "buddy": 0,
+    }
     if not curses.has_colors():
         return palette
     curses.start_color()
@@ -197,6 +331,7 @@ def _init_colors() -> dict[str, int]:
     curses.init_pair(4, curses.COLOR_GREEN, -1)
     curses.init_pair(5, curses.COLOR_RED, -1)
     curses.init_pair(6, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(7, curses.COLOR_WHITE, -1)
     palette = {
         "base": curses.color_pair(1),
         "accent": curses.color_pair(6) | curses.A_BOLD,
@@ -205,6 +340,9 @@ def _init_colors() -> dict[str, int]:
         "good": curses.color_pair(4) | curses.A_BOLD,
         "bad": curses.color_pair(5) | curses.A_BOLD,
         "hot": curses.color_pair(6) | curses.A_BOLD,
+        "user": curses.color_pair(7) | curses.A_BOLD,
+        "system": curses.color_pair(3),
+        "buddy": curses.color_pair(4),
     }
     return palette
 
@@ -243,18 +381,159 @@ def _role_state(machine: dict[str, Any], role: str) -> str:
     return "ok"
 
 
-def _draw_header(stdscr: Any, workspace: str, mission_count: int, fleet_count: int, runtime: dict[str, Any], memory: dict[str, Any], health: dict[str, Any], colors: dict[str, int]) -> None:
+def _render_role_token(state: str, selected: bool, focused: bool) -> str:
+    if selected and focused:
+        return f"*{state}*"
+    if selected:
+        return f"<{state}>"
+    if focused:
+        return f"{{{state}}}"
+    return f"[{state}]"
+
+
+def _message_attr(role: str, colors: dict[str, int]) -> int:
+    if role == "user":
+        return colors["user"]
+    if role == "system":
+        return colors["system"]
+    if role == "buddy":
+        return colors["buddy"]
+    if role == "constant":
+        return colors["accent"]
+    return colors["base"]
+
+
+def _thread_preview(workspace: str, mission_id: str | None = None) -> str:
+    history = read_chat_history(workspace=workspace, mission_id=mission_id, limit=1)
+    if not history:
+        return "Start a conversation"
+    last = history[-1]
+    content = str(last.get("content", "")).strip() or "(empty)"
+    role = CHAT_LABELS.get(str(last.get("role", "system")), str(last.get("role", "system")).upper())
+    return f"{role}: {content}"
+
+
+def _streamed_text(state: TuiState, mission_id: str | None, text: str) -> str:
+    if not state.stream_text or state.stream_text != text:
+        return text
+    if state.stream_mission_id != mission_id:
+        return text
+    elapsed = max(0.0, time.time() - state.stream_started_at)
+    if elapsed >= state.stream_duration:
+        return text
+    total = max(1, len(text))
+    progress = max(1, min(total, int(total * (elapsed / max(0.1, state.stream_duration)))))
+    return text[:progress]
+
+
+def _public_skill_menu() -> list[dict[str, Any]]:
+    return list_skills(include_internal=False)
+
+
+def _skill_menu_candidates(input_buffer: str) -> list[dict[str, Any]]:
+    if not input_buffer.startswith("/"):
+        return []
+    payload = input_buffer[1:]
+    if not payload:
+        return _public_skill_menu()
+    if payload.startswith("skill "):
+        query = payload[len("skill ") :].strip().lower()
+        if " " in query:
+            return []
+    else:
+        stripped = payload.strip().lower()
+        if " " in stripped:
+            return []
+        query = stripped
+    skills = _public_skill_menu()
+    if not query:
+        return skills
+    ranked: list[tuple[int, dict[str, Any]]] = []
+    for skill in skills:
+        score = 0
+        skill_id = str(skill["id"]).lower()
+        label = str(skill["label"]).lower()
+        summary = str(skill["summary"]).lower()
+        aliases = " ".join(str(alias).lower() for alias in skill.get("aliases", []))
+        if skill_id.startswith(query):
+            score += 5
+        if query in skill_id:
+            score += 3
+        if query in label:
+            score += 2
+        if query in aliases:
+            score += 2
+        if query in summary:
+            score += 1
+        if score > 0:
+            ranked.append((score, skill))
+    ranked.sort(key=lambda item: (-item[0], item[1]["id"]))
+    return [item[1] for item in ranked] or skills
+
+
+def _slash_menu_pending(input_buffer: str) -> bool:
+    return input_buffer.startswith("/") and bool(_skill_menu_candidates(input_buffer))
+
+
+def _complete_slash_skill(input_buffer: str, selection: dict[str, Any]) -> str:
+    if input_buffer.startswith("/skill "):
+        return f"/skill {selection['id']} "
+    return f"/{selection['id']} "
+
+
+def _draw_skill_menu(
+    stdscr: Any,
+    y: int,
+    x: int,
+    width: int,
+    candidates: list[dict[str, Any]],
+    selected_index: int,
+    colors: dict[str, int],
+) -> None:
+    if not candidates or width < 28:
+        return
+    visible = candidates[: min(5, len(candidates))]
+    height = len(visible) + 3
+    _draw_box(stdscr, y, x, height, width, "Skill Menu", colors["accent"])
+    _safe_addstr(stdscr, y + 1, x + 2, "Tab/↑↓ browse | Enter complete", colors["muted"])
+    row = y + 2
+    selected = max(0, min(selected_index, len(visible) - 1))
+    for index, skill in enumerate(visible):
+        marker = ">" if index == selected else " "
+        skill_id = str(skill["id"])
+        summary = str(skill["summary"])
+        line = f"{marker} /{skill_id:<24} {summary}"
+        attr = colors["accent"] if index == selected else colors["base"]
+        _safe_addstr(stdscr, row, x + 1, _clip(line, width - 3), attr)
+        row += 1
+
+
+def _draw_header(
+    stdscr: Any,
+    workspace: str,
+    mission_count: int,
+    fleet_count: int,
+    runtime: dict[str, Any],
+    memory: dict[str, Any],
+    health: dict[str, Any],
+    colors: dict[str, int],
+    chat_scope_label: str,
+    selected_machine_label: str | None,
+    selected_role: str,
+) -> None:
     memory_counts = memory.get("counts", {})
     planner_backend = health.get("models", {}).get("planner", {}).get("backend", "heuristic")
     buddy_backend = health.get("models", {}).get("buddy", {}).get("backend", "heuristic")
     cockpit_state = "up" if runtime.get("fleet_session_exists") else "down"
-    _safe_addstr(stdscr, 0, 2, "########## CONSTANT::DEMOSCENE::TUI ##########", colors["accent"])
+    focused = f"{runtime.get('focused_machine') or '-'}:{runtime.get('focused_role') or '-'}"
+    selected = f"{selected_machine_label or '-'}:{selected_role}"
+    _safe_addstr(stdscr, 0, 2, "Constant :: chat-first fleet cockpit", colors["accent"])
     _safe_addstr(
         stdscr,
         1,
         2,
         _clip(
-            f"workspace={workspace}  fleet={fleet_count}  cockpit={cockpit_state}  missions={mission_count}  docs={memory_counts.get('documents', 0)}  chunks={memory_counts.get('chunks', 0)}  decisions={memory_counts.get('decisions', 0)}",
+            f"workspace={workspace}  scope={chat_scope_label}  cockpit={cockpit_state}  fleet={fleet_count}  threads={mission_count}",
             max(20, stdscr.getmaxyx()[1] - 4),
         ),
         colors["base"],
@@ -264,7 +543,7 @@ def _draw_header(stdscr: Any, workspace: str, mission_count: int, fleet_count: i
         2,
         2,
         _clip(
-            f"planner={planner_backend}  buddy={buddy_backend}  keys: j/k mission  [/ ] machine  1..4 pane  o jump  r restart  z cockpit  q quit",
+            f"planner={planner_backend}  buddy={buddy_backend}  selected={selected}  focused={focused}  docs={memory_counts.get('documents', 0)}  decisions={memory_counts.get('decisions', 0)}",
             max(20, stdscr.getmaxyx()[1] - 4),
         ),
         colors["muted"],
@@ -281,10 +560,10 @@ def _draw_header(stdscr: Any, workspace: str, mission_count: int, fleet_count: i
 
 
 def _draw_missions(stdscr: Any, y: int, x: int, height: int, width: int, missions: list[dict[str, Any]], selected: int, colors: dict[str, int]) -> None:
-    _draw_box(stdscr, y, x, height, width, "Mission Deck", colors["accent"])
+    _draw_box(stdscr, y, x, height, width, "Threads", colors["accent"])
     row = y + 1
     if not missions:
-        _safe_addstr(stdscr, row, x + 2, "No missions yet. Use `Constant mission create`.", colors["muted"])
+        _safe_addstr(stdscr, row, x + 2, "No missions yet. Start typing.", colors["muted"])
         return
     for index, mission in enumerate(missions[: max(1, height - 2)]):
         marker = ">" if index == selected else " "
@@ -297,36 +576,111 @@ def _draw_missions(stdscr: Any, y: int, x: int, height: int, width: int, mission
             break
 
 
-def _draw_board(stdscr: Any, y: int, x: int, height: int, width: int, mission: dict[str, Any] | None, colors: dict[str, int]) -> None:
-    _draw_box(stdscr, y, x, height, width, "Mission Board", colors["accent"])
-    row = y + 1
-    if not mission:
-        lines = [
-            "No active mission selected.",
-            "",
-            "Try:",
-            "Constant mission create \"audit this repo\" --workspace \"$PWD\"",
-        ]
-        _write_wrapped(stdscr, row, x + 2, width - 4, lines, colors["muted"])
-        return
-
-    row = _write_wrapped(stdscr, row, x + 2, width - 4, [mission["title"]], colors["hot"])
+def _draw_threads_focus(
+    stdscr: Any,
+    y: int,
+    x: int,
+    height: int,
+    width: int,
+    workspace: str,
+    missions: list[dict[str, Any]],
+    selected: int,
+    colors: dict[str, int],
+) -> None:
+    _safe_addstr(stdscr, y, x + 1, "Chats", colors["accent"])
+    row = y + 2
+    _safe_addstr(stdscr, row, x + 1, _clip("global", width - 2), colors["hot"])
     row += 1
-    row = _write_wrapped(stdscr, row, x + 2, width - 4, [mission.get("goal", "")], colors["base"])
-    row += 1
-    _safe_addstr(stdscr, row, x + 2, f"workspace: {mission.get('workspace', '-')}", colors["muted"])
+    _safe_addstr(stdscr, row, x + 2, _clip(_thread_preview(workspace), width - 3), colors["muted"])
     row += 2
-    _safe_addstr(stdscr, row, x + 2, "steps:", colors["accent"])
-    row += 1
-    for step in mission.get("steps", [])[: max(1, height - (row - y) - 2)]:
-        line = f"[{_status_tag(step['status'])}] {step['step_id']}  {step['machine']}/{step['cli']}/{step['backend']}"
-        _safe_addstr(stdscr, row, x + 2, _clip(line, width - 4), colors["base"])
+    if not missions:
+        _safe_addstr(stdscr, row, x + 1, "No mission threads yet.", colors["muted"])
+        return
+    for index, mission in enumerate(missions[: max(1, height - 6)]):
+        marker = "›" if index == selected else " "
+        title = f"{marker} {mission['title']}"
+        attr = colors["accent"] if index == selected else colors["base"]
+        _safe_addstr(stdscr, row, x + 1, _clip(title, width - 2), attr)
         row += 1
-        details = step.get("result_summary") or step.get("qwen_review") or step.get("title", "")
-        if details and row < y + height - 1:
-            row = _write_wrapped(stdscr, row, x + 4, width - 6, [details], colors["muted"])
+        _safe_addstr(
+            stdscr,
+            row,
+            x + 2,
+            _clip(_thread_preview(mission.get("workspace", workspace), mission["mission_id"]), width - 3),
+            colors["muted"],
+        )
+        row += 2
         if row >= y + height - 1:
             break
+
+
+def _draw_conversation(
+    stdscr: Any,
+    y: int,
+    x: int,
+    height: int,
+    width: int,
+    entries: list[dict[str, Any]],
+    mission: dict[str, Any] | None,
+    state: TuiState,
+    colors: dict[str, int],
+    focus_mode: bool = False,
+) -> None:
+    if mission and mission.get("steps"):
+        step = next((entry for entry in mission["steps"] if entry.get("status") not in {"done", "failed"}), mission["steps"][0])
+        scope = f"{mission['title']} :: {step.get('skill', '-')} / {step.get('agent', '-')}"
+        compact_scope = f"{mission['title']}  ·  {step.get('skill', '-')} / {step.get('agent', '-')}"
+    else:
+        scope = f"mission {mission['mission_id'][:6]}" if mission else "workspace"
+        compact_scope = scope
+    if focus_mode:
+        _safe_addstr(stdscr, y, x + 1, "Constant", colors["accent"])
+        _safe_addstr(stdscr, y + 1, x + 1, _clip(compact_scope, width - 2), colors["muted"])
+        row = y + 3
+    else:
+        _draw_box(stdscr, y, x, height, width, f"Constant :: {scope}", colors["accent"])
+        row = y + 1
+    if not entries:
+        hints = [
+            "No conversation yet.",
+            "",
+            "Type directly to talk to Constant.",
+            "Use / for workflow skills.",
+            "Actionable prompts create missions immediately.",
+        ]
+        _write_wrapped(stdscr, row, x + 2, width - 4, hints, colors["muted"])
+        return
+
+    rendered: list[tuple[str, int]] = []
+    mission_id = mission.get("mission_id") if mission else None
+    for entry in entries:
+        role = str(entry.get("role", "system"))
+        label = CHAT_LABELS.get(role, role.upper())
+        timestamp = str(entry.get("timestamp", ""))[-9:-1]
+        meta = entry.get("meta") or {}
+        skill_tag = str(meta.get("skill", "")).strip()
+        badge = f"[{skill_tag}] " if skill_tag else ""
+        prefix = f"{timestamp} {label:<8}> {badge}" if not focus_mode else f"{label.lower():>8} "
+        content = str(entry.get("content", "")).strip() or "(empty)"
+        if role == "constant":
+            content = _streamed_text(state, mission_id, content)
+        wrapped = textwrap.wrap(content, max(10, width - 4 - len(prefix)), subsequent_indent=" " * len(prefix)) or [content]
+        rendered.append((prefix + wrapped[0], _message_attr(role, colors)))
+        for line in wrapped[1:]:
+            rendered.append((" " * len(prefix) + line.lstrip(), _message_attr(role, colors)))
+        if meta.get("created_mission_id"):
+            rendered.append((f"{' ' * len(prefix)}-> mission {meta['created_mission_id']}", colors["system"]))
+        route_bits = [str(meta.get("agent", "")).strip(), str(meta.get("cli", "")).strip()]
+        route = " / ".join(part for part in route_bits if part)
+        if route:
+            rendered.append((f"{' ' * len(prefix)}-> route {route}", colors["muted"]))
+
+    visible = rendered[-max(1, height - 2):]
+    for line, attr in visible:
+        if row >= y + height - 1:
+            break
+        _safe_addstr(stdscr, row, x + 2, _clip(line, width - 4), attr)
+        row += 1
 
 
 def _draw_runtime(
@@ -336,44 +690,101 @@ def _draw_runtime(
     height: int,
     width: int,
     runtime: dict[str, Any],
+    mission: dict[str, Any] | None,
     selected_machine: int,
     selected_role: str,
     colors: dict[str, int],
 ) -> None:
-    _draw_box(stdscr, y, x, height, width, "Cockpit Runtime", colors["accent"])
+    _draw_box(stdscr, y, x, height, width, "Fleet Context", colors["accent"])
     row = y + 1
     machines = runtime.get("machines", [])
     if not machines:
         _safe_addstr(stdscr, row, x + 2, "No runtime data yet. Open the cockpit with z.", colors["muted"])
         return
 
-    header = "machine            claude codex copilot vibe  session  target"
+    header = "sel live machine            claude codex copilot vibe  state    target"
     _safe_addstr(stdscr, row, x + 2, _clip(header, width - 4), colors["hot"])
     row += 1
 
+    mission_steps = mission.get("steps", []) if mission else []
     for index, machine in enumerate(machines[: max(1, height - 3)]):
-        marker = ">" if index == selected_machine else " "
-        attr = colors["accent"] if index == selected_machine else colors["base"]
+        selected = index == selected_machine
+        focused = machine["label"] == runtime.get("focused_machine")
+        marker = ">" if selected else " "
+        live = "*" if focused else " "
+        attr = colors["accent"] if selected else (colors["hot"] if focused else colors["base"])
         status = "up" if machine.get("session_exists") else "down"
         role_bits = []
         for role in ROLES:
             state = _role_state(machine, role)
-            token = f"[{state}]"
-            if role == selected_role and index == selected_machine:
-                token = f"<{state}>"
+            token = _render_role_token(state, selected and role == selected_role, focused and role == runtime.get("focused_role"))
             role_bits.append(token)
-        line = f"{marker} {machine['label']:<16} {' '.join(role_bits)}  {status:<7} {machine['target']}"
+        line = f"{marker}   {live} {machine['label']:<16} {' '.join(role_bits)}  {status:<7} {machine['target']}"
         _safe_addstr(stdscr, row, x + 1, _clip(line, width - 3), attr)
         row += 1
+        matching = sorted(
+            (step for step in mission_steps if step.get("machine") == machine["label"]),
+            key=lambda step: (step.get("status") in {"done", "failed"}, step.get("attempt", 0)),
+        )
+        for step in matching[:1]:
+            route_line = (
+                f"      route {step.get('cli', '-')}/{step.get('backend', '-')}  "
+                f"skill={step.get('skill', '-')}  agent={step.get('agent', '-')}"
+            )
+            route_attr = colors["muted"] if not selected else colors["good"]
+            if row < y + height - 1:
+                _safe_addstr(stdscr, row, x + 1, _clip(route_line, width - 3), route_attr)
+                row += 1
         if row >= y + height - 1:
             break
 
 
-def _draw_buddy(stdscr: Any, y: int, x: int, height: int, width: int, review: dict[str, str], memory: dict[str, Any], colors: dict[str, int]) -> None:
-    _draw_box(stdscr, y, x, height, width, "Hexapus Buddy Rail", colors["accent"])
+def _draw_capture_view(
+    stdscr: Any,
+    y: int,
+    x: int,
+    height: int,
+    width: int,
+    capture_state: dict[str, Any],
+    colors: dict[str, int],
+) -> None:
+    title = f"Capture View :: {capture_state['machine']}:{capture_state['pane']}"
+    _draw_box(stdscr, y, x, height, width, title, colors["accent"])
+    lines = capture_state.get("lines", []) or ["(empty capture)"]
+    row = y + 1
+    body_height = max(1, height - 2)
+    max_scroll = max(0, len(lines) - body_height)
+    scroll = max(0, min(capture_state.get("scroll", 0), max_scroll))
+    capture_state["scroll"] = scroll
+    status_bits = [f"scroll {scroll + 1}/{max(1, max_scroll + 1)}"]
+    if capture_state.get("returncode"):
+        status_bits.append(f"rc={capture_state['returncode']}")
+    _safe_addstr(stdscr, row, x + 2, _clip(" | ".join(status_bits), width - 4), colors["muted"])
+    row += 1
+    visible = lines[scroll : scroll + max(1, body_height - 1)]
+    for line in visible:
+        if row >= y + height - 1:
+            break
+        attr = colors["bad"] if capture_state.get("returncode") else colors["base"]
+        _safe_addstr(stdscr, row, x + 2, _clip(line, width - 4), attr)
+        row += 1
+
+
+def _draw_buddy(
+    stdscr: Any,
+    y: int,
+    x: int,
+    height: int,
+    width: int,
+    review: dict[str, str],
+    memory: dict[str, Any],
+    colors: dict[str, int],
+    tick: int,
+) -> None:
+    _draw_box(stdscr, y, x, height, width, "Buddy", colors["accent"])
     row = y + 1
     verdict_attr = _verdict_attr(review, colors)
-    for line in _hexapus_lines():
+    for line in _hexapus_lines(review["verdict"], tick):
         if row >= y + height - 1:
             return
         _safe_addstr(stdscr, row, x + 2, _clip(line, width - 4), verdict_attr)
@@ -404,6 +815,53 @@ def _draw_buddy(stdscr: Any, y: int, x: int, height: int, width: int, review: di
         row += 1
 
 
+def _draw_context_rail(
+    stdscr: Any,
+    y: int,
+    x: int,
+    height: int,
+    width: int,
+    review: dict[str, str],
+    runtime: dict[str, Any],
+    mission: dict[str, Any] | None,
+    selected_machine_label: str | None,
+    selected_role: str,
+    colors: dict[str, int],
+    tick: int,
+) -> None:
+    _draw_box(stdscr, y, x, height, width, "Live", colors["accent"])
+    row = y + 1
+    verdict_attr = _verdict_attr(review, colors)
+    for line in _hexapus_lines(review["verdict"], tick)[:8]:
+        if row >= y + height - 1:
+            return
+        _safe_addstr(stdscr, row, x + 2, _clip(line, width - 4), verdict_attr)
+        row += 1
+    row += 1
+    lines = [
+        f"buddy     {review['verdict']} / {review['confidence']}",
+        f"selected  {selected_machine_label or '-'}:{selected_role}",
+        f"focused   {runtime.get('focused_machine') or '-'}:{runtime.get('focused_role') or '-'}",
+    ]
+    if mission and mission.get("steps"):
+        step = next((entry for entry in mission["steps"] if entry.get("status") not in {"done", "failed"}), mission["steps"][0])
+        lines.extend(
+            [
+                f"skill     {step.get('skill', '-')}",
+                f"agent     {step.get('agent', '-')}",
+                f"route     {step.get('cli', '-')}/{step.get('backend', '-')}",
+            ]
+        )
+    for line in lines:
+        if row >= y + height - 1:
+            return
+        _safe_addstr(stdscr, row, x + 2, _clip(line, width - 4), colors["base"])
+        row += 1
+    row += 1
+    if row < y + height - 1:
+        _write_wrapped(stdscr, row, x + 2, width - 4, [review["why"]], colors["muted"])
+
+
 def _draw_timeline(stdscr: Any, y: int, x: int, height: int, width: int, events: list[str], persona_lines: list[str], decision_lines: list[str], colors: dict[str, int]) -> None:
     _draw_box(stdscr, y, x, height, width, "Timeline + Memory", colors["accent"])
     half = max(20, width // 2)
@@ -424,6 +882,35 @@ def _draw_timeline(stdscr: Any, y: int, x: int, height: int, width: int, events:
             break
 
 
+def _compute_layout(height: int, width: int, chat_focus: bool) -> TuiLayout:
+    top = 4
+    footer_height = 2
+    timeline_height = 0 if chat_focus else min(6, max(4, height // 8))
+    main_height = max(12, height - top - timeline_height - footer_height)
+    if chat_focus:
+        left_width = max(20, min(24, width // 6))
+        right_width = max(22, min(28, width // 5))
+    else:
+        left_width = max(22, min(28, width // 5))
+        right_width = max(24, min(30, width // 4))
+    center_width = max(28, width - left_width - right_width - 4)
+    conversation_height = main_height if chat_focus else max(10, int(main_height * 0.74))
+    runtime_height = 0 if chat_focus else max(6, main_height - conversation_height)
+    return TuiLayout(
+        height=height,
+        width=width,
+        top=top,
+        footer_height=footer_height,
+        timeline_height=timeline_height,
+        main_height=main_height,
+        left_width=left_width,
+        right_width=right_width,
+        center_width=center_width,
+        conversation_height=conversation_height,
+        runtime_height=runtime_height,
+    )
+
+
 def _collect_snapshot(default_workspace: str, selected_index: int, local_session: str, machine_session: str, runtime_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
     missions = sorted(list_missions(), key=lambda item: item.get("updated_at", ""), reverse=True)
     if missions:
@@ -442,6 +929,8 @@ def _collect_snapshot(default_workspace: str, selected_index: int, local_session
     events = _recent_events(selected_mission["mission_id"] if selected_mission else None)
     fleet = load_fleet_config()
     runtime = runtime_snapshot if runtime_snapshot is not None else _safe_runtime_status(local_session, machine_session)
+    chat_history = read_chat_history(workspace=workspace, mission_id=selected_mission["mission_id"] if selected_mission else None, limit=80)
+    chat_scope_label = f"mission:{selected_mission['mission_id'][:6]}" if selected_mission else "workspace"
     return {
         "missions": missions,
         "selected_index": selected_index,
@@ -455,168 +944,777 @@ def _collect_snapshot(default_workspace: str, selected_index: int, local_session
         "events": events,
         "fleet_count": len(fleet["machines"]),
         "runtime": runtime,
+        "chat_history": chat_history,
+        "chat_scope_label": chat_scope_label,
     }
+
+
+def _ensure_mission_planned(mission: dict[str, Any]) -> dict[str, Any]:
+    if mission["steps"]:
+        return mission
+    payload = daemon_request("plan", {"mission": mission})
+    mission["steps"] = payload["plan"]["steps"]
+    mission["title"] = payload["plan"]["title"]
+    mission["status"] = "planned"
+    mission["planner_summary"] = payload["plan"]["summary"]
+    mission["buddy_review"] = payload["buddy_review"]
+    save_mission(mission)
+    append_event(mission["mission_id"], "mission.planned", payload)
+    return mission
+
+
+def _selected_machine_label(snapshot: dict[str, Any], selected_machine: int) -> str | None:
+    machines = snapshot["runtime"].get("machines", [])
+    if not machines:
+        return None
+    return machines[selected_machine]["label"]
+
+
+def _open_capture(machine: str, pane: str, machine_session: str, current_height: int, current_scroll: int | None = None) -> dict[str, Any]:
+    capture = capture_pane(machine, pane, lines=200, machine_session=machine_session)
+    if capture.get("returncode", 0) != 0:
+        error_text = capture.get("stderr") or capture.get("stdout") or "capture command failed"
+        lines = [line for line in error_text.splitlines() if line] or ["capture command failed"]
+    else:
+        text = capture.get("stdout") or ""
+        lines = text.splitlines() or ["(empty capture)"]
+    view_height = max(8, current_height - 2)
+    scroll = max(0, len(lines) - view_height) if current_scroll is None else min(max(0, current_scroll), max(0, len(lines) - view_height))
+    return {
+        "machine": machine,
+        "pane": pane,
+        "lines": lines,
+        "scroll": scroll,
+        "returncode": int(capture.get("returncode", 0)),
+        "raw": capture,
+    }
+
+
+def _process_chat_submission(
+    text: str,
+    snapshot: dict[str, Any],
+    selected_machine: int,
+    selected_role: str,
+    local_session: str,
+    machine_session: str,
+    runtime_height: int,
+) -> dict[str, Any]:
+    message = text.strip()
+    if not message:
+        return {
+            "flash": "empty prompt",
+            "force_select_mission_id": None,
+            "capture_state": None,
+            "invalidate_runtime": False,
+            "next_action": None,
+        }
+
+    mission = snapshot["selected_mission"]
+    mission_id = mission["mission_id"] if mission else None
+    workspace = snapshot["workspace"]
+    machine_label = _selected_machine_label(snapshot, selected_machine)
+
+    append_chat_message(
+        "user",
+        message,
+        workspace=workspace,
+        mission_id=mission_id,
+        machine=machine_label,
+        pane=selected_role,
+    )
+    if mission_id:
+        append_event(mission_id, "chat.user", {"content": message, "machine": machine_label, "pane": selected_role})
+
+    payload = daemon_request(
+        "chat",
+        {
+            "message": message,
+            "mission": mission,
+            "workspace": workspace,
+            "selected_machine": machine_label,
+            "selected_role": selected_role,
+            "chat_history": snapshot["chat_history"][-12:],
+        },
+    )
+
+    reply = str(payload.get("reply", "")).strip() or "No reply."
+    buddy_note = payload.get("buddy_note")
+    intent = payload.get("intent", "plain_chat")
+    action = payload.get("cockpit_action")
+    requested_skill = payload.get("skill") or {}
+    requested_skill_id = str(requested_skill.get("id", "")).strip()
+    routing_overrides = payload.get("routing_overrides") or {}
+
+    capture_state = None
+    next_action = None
+    force_select_mission_id = None
+    thread_mission_id = mission_id
+
+    if intent == "mission_create":
+        mission = create_mission(
+            payload.get("mission_goal") or message,
+            workspace,
+            routing_overrides=routing_overrides,
+        )
+        mission = _ensure_mission_planned(mission)
+        force_select_mission_id = mission["mission_id"]
+        step = mission["steps"][0] if mission.get("steps") else {}
+        step_skill = step.get("skill", requested_skill_id)
+        append_chat_message(
+            "system",
+            f"Promoted to mission {mission['mission_id']} :: {mission['title']}",
+            workspace=workspace,
+            mission_id=mission_id,
+            intent="mission_create",
+            machine=machine_label,
+            pane=selected_role,
+            meta={
+                "created_mission_id": mission["mission_id"],
+                "skill": step_skill,
+                "agent": step.get("agent"),
+                "cli": step.get("cli"),
+            },
+        )
+        append_chat_message(
+            "user",
+            message,
+            workspace=workspace,
+            mission_id=mission["mission_id"],
+            intent="mission_create",
+            machine=machine_label,
+            pane=selected_role,
+            meta={"skill": step_skill},
+        )
+        append_chat_message(
+            "constant",
+            reply,
+            workspace=workspace,
+            mission_id=mission["mission_id"],
+            intent="mission_create",
+            machine=machine_label,
+            pane=selected_role,
+            meta={
+                "created_mission_id": mission["mission_id"],
+                "skill": step_skill,
+                "agent": step.get("agent"),
+                "cli": step.get("cli"),
+            },
+        )
+        if buddy_note:
+            append_chat_message(
+                "buddy",
+                str(buddy_note.get("answer", "")),
+                workspace=workspace,
+                mission_id=mission["mission_id"],
+                intent="buddy_answer",
+                meta={"skill": step_skill},
+            )
+        append_event(mission["mission_id"], "chat.constant", {"intent": intent, "reply": reply})
+        return {
+            "flash": f"mission created {mission['mission_id']} -> {mission['title']} [{step.get('skill', '-')} / {step.get('agent', '-')}]",
+            "force_select_mission_id": force_select_mission_id,
+            "capture_state": None,
+            "invalidate_runtime": False,
+            "stream_text": reply,
+            "stream_mission_id": mission["mission_id"],
+            "next_action": None,
+        }
+
+    append_chat_message(
+        "constant",
+        reply,
+        workspace=workspace,
+        mission_id=thread_mission_id,
+        intent=intent,
+        machine=machine_label,
+        pane=selected_role,
+        meta={
+            "memory_hits": payload.get("memory_hits", [])[:3],
+            "skill": requested_skill_id,
+            "agent": routing_overrides.get("agent"),
+            "cli": routing_overrides.get("cli"),
+        },
+    )
+    if thread_mission_id:
+        append_event(thread_mission_id, "chat.constant", {"intent": intent, "reply": reply})
+
+    if buddy_note:
+        append_chat_message(
+            "buddy",
+            str(buddy_note.get("answer", "")),
+            workspace=workspace,
+            mission_id=thread_mission_id,
+            intent="buddy_answer",
+            meta={"skill": requested_skill_id},
+        )
+
+    if action:
+        action_type = action.get("type")
+        action_machine = action.get("machine") or machine_label
+        action_pane = action.get("pane") or selected_role
+        try:
+            if action_type == "focus" and action_machine:
+                focus_machine(action_machine, action_pane, local_session=local_session, machine_session=machine_session)
+                append_chat_message("system", f"Focused {action_machine}:{action_pane}", workspace=workspace, mission_id=thread_mission_id, intent=intent)
+                return {
+                    "flash": f"focused {action_machine}:{action_pane}",
+                    "force_select_mission_id": None,
+                    "capture_state": None,
+                    "invalidate_runtime": True,
+                    "next_action": None,
+                }
+            if action_type == "restart" and action_machine:
+                restart_pane(action_machine, action_pane, machine_session=machine_session)
+                append_chat_message("system", f"Restart sent to {action_machine}:{action_pane}", workspace=workspace, mission_id=thread_mission_id, intent=intent)
+                return {
+                    "flash": f"restart sent to {action_machine}:{action_pane}",
+                    "force_select_mission_id": None,
+                    "capture_state": None,
+                    "invalidate_runtime": True,
+                    "next_action": None,
+                }
+            if action_type == "capture" and action_machine:
+                capture_state = _open_capture(action_machine, action_pane, machine_session, runtime_height)
+                append_chat_message("system", f"Captured {action_machine}:{action_pane}", workspace=workspace, mission_id=thread_mission_id, intent=intent)
+                return {
+                    "flash": f"capture loaded for {action_machine}:{action_pane}",
+                    "force_select_mission_id": None,
+                    "capture_state": capture_state,
+                    "invalidate_runtime": False,
+                    "next_action": None,
+                }
+            if action_type == "open":
+                append_chat_message("system", "Opening full cockpit view", workspace=workspace, mission_id=thread_mission_id, intent=intent)
+                return {
+                    "flash": "opening full cockpit",
+                    "force_select_mission_id": None,
+                    "capture_state": None,
+                    "invalidate_runtime": False,
+                    "next_action": {"action": "cockpit", "workspace": workspace},
+                }
+        except Exception as exc:  # noqa: BLE001
+            append_chat_message("system", _error_line("cockpit action failed", exc), workspace=workspace, mission_id=thread_mission_id, intent="cockpit_error")
+            return {
+                "flash": _error_line("cockpit action failed", exc),
+                "force_select_mission_id": None,
+                "capture_state": None,
+                "invalidate_runtime": False,
+                "next_action": None,
+            }
+
+    return {
+        "flash": "message routed through Constant",
+        "force_select_mission_id": None,
+        "capture_state": None,
+        "invalidate_runtime": False,
+        "stream_text": reply,
+        "stream_mission_id": thread_mission_id,
+        "next_action": next_action,
+    }
+
+
+def _draw_status_and_prompt(
+    stdscr: Any,
+    height: int,
+    width: int,
+    *,
+    flash: str,
+    flash_until: float,
+    input_mode: bool,
+    input_buffer: str,
+    capture_state: dict[str, Any] | None,
+    snapshot: dict[str, Any],
+    selected_machine_label: str | None,
+    selected_role: str,
+    colors: dict[str, int],
+) -> None:
+    now = time.time()
+    if flash and now < flash_until:
+        status = flash
+        status_attr = colors["warn"]
+    elif capture_state:
+        status = "capture | j/k scroll | PgUp/PgDn page | c refresh | x close | q quit"
+        status_attr = colors["muted"]
+    elif input_mode:
+        status = "chat | Enter send | / skills | Tab menu | Esc cockpit | Ctrl-U clear"
+        status_attr = colors["muted"]
+    else:
+        focused = f"{snapshot['runtime'].get('focused_machine') or '-'}:{snapshot['runtime'].get('focused_role') or '-'}"
+        selected = f"{selected_machine_label or '-'}:{selected_role}"
+        view = "chat-focus" if snapshot.get("chat_focus") else "cockpit-detail"
+        status = f"cockpit | type to chat | f view | [/] machine | 1..4 pane | o focus | x capture | r restart | z tabs | q quit | {view} | sel={selected} | live={focused}"
+        status_attr = colors["muted"]
+
+    prompt_prefix = "› "
+    prompt_text = prompt_prefix + input_buffer
+    if input_mode:
+        prompt_text += "_"
+
+    _safe_addstr(stdscr, height - 2, 2, _clip(status, width - 4), status_attr)
+    _safe_addstr(stdscr, height - 1, 2, _clip(prompt_text, width - 4), colors["hot"] if input_mode else colors["base"])
+    if input_mode:
+        try:
+            cursor_x = min(width - 2, 2 + len(prompt_prefix) + len(input_buffer))
+            stdscr.move(height - 1, max(2, cursor_x))
+        except curses.error:
+            pass
+
+
+def _refresh_snapshot(state: TuiState, workspace: str, local_session: str, machine_session: str) -> dict[str, Any]:
+    now = time.time()
+    if state.runtime_cache is None or now >= state.runtime_refresh_at:
+        state.runtime_cache = _safe_runtime_status(local_session, machine_session)
+        state.runtime_refresh_at = now + 2.0
+
+    snapshot = _collect_snapshot(workspace, state.selected_index, local_session, machine_session, runtime_snapshot=state.runtime_cache)
+    if state.pending_select_mission_id:
+        for index, mission in enumerate(snapshot["missions"]):
+            if mission["mission_id"] == state.pending_select_mission_id:
+                state.selected_index = index
+                snapshot = _collect_snapshot(workspace, state.selected_index, local_session, machine_session, runtime_snapshot=state.runtime_cache)
+                break
+        state.pending_select_mission_id = None
+
+    state.selected_index = snapshot["selected_index"]
+    runtime_machines = snapshot["runtime"].get("machines", [])
+    if runtime_machines:
+        state.selected_machine = max(0, min(state.selected_machine, len(runtime_machines) - 1))
+    else:
+        state.selected_machine = 0
+    return snapshot
+
+
+def _draw_frame(stdscr: Any, snapshot: dict[str, Any], state: TuiState, colors: dict[str, int]) -> TuiLayout:
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    layout = _compute_layout(height, width, state.chat_focus and not state.capture_state)
+    snapshot["chat_focus"] = state.chat_focus and not state.capture_state
+    machine_label = _selected_machine_label(snapshot, state.selected_machine)
+
+    _draw_header(
+        stdscr,
+        snapshot["workspace"],
+        len(snapshot["missions"]),
+        snapshot["fleet_count"],
+        snapshot["runtime"],
+        snapshot["memory"],
+        snapshot["health"],
+        colors,
+        snapshot["chat_scope_label"],
+        machine_label,
+        state.selected_role,
+    )
+    if state.chat_focus and not state.capture_state:
+        _draw_threads_focus(
+            stdscr,
+            layout.top,
+            0,
+            layout.main_height,
+            layout.left_width,
+            snapshot["workspace"],
+            snapshot["missions"],
+            state.selected_index,
+            colors,
+        )
+    else:
+        _draw_missions(stdscr, layout.top, 0, layout.main_height, layout.left_width, snapshot["missions"], state.selected_index, colors)
+    _draw_conversation(
+        stdscr,
+        layout.top,
+        layout.left_width + 1,
+        layout.conversation_height,
+        layout.center_width,
+        snapshot["chat_history"],
+        snapshot["selected_mission"],
+        state,
+        colors,
+        state.chat_focus and not state.capture_state,
+    )
+    skill_candidates = _skill_menu_candidates(state.input_buffer) if state.input_mode else []
+    if skill_candidates:
+        menu_width = min(max(44, layout.center_width - 4), layout.center_width)
+        _draw_skill_menu(
+            stdscr,
+            layout.top + 2,
+            layout.left_width + 3,
+            menu_width,
+            skill_candidates,
+            state.slash_menu_index,
+            colors,
+        )
+    if state.capture_state:
+        _draw_capture_view(
+            stdscr,
+            layout.top + layout.conversation_height,
+            layout.left_width + 1,
+            layout.runtime_height,
+            layout.center_width,
+            state.capture_state,
+            colors,
+        )
+    elif not state.chat_focus:
+        _draw_runtime(
+            stdscr,
+            layout.top + layout.conversation_height,
+            layout.left_width + 1,
+            layout.runtime_height,
+            layout.center_width,
+            snapshot["runtime"],
+            snapshot["selected_mission"],
+            state.selected_machine,
+            state.selected_role,
+            colors,
+        )
+    if state.chat_focus and not state.capture_state:
+        _draw_context_rail(
+            stdscr,
+            layout.top,
+            layout.left_width + layout.center_width + 2,
+            layout.main_height,
+            layout.right_width,
+            snapshot["review"],
+            snapshot["runtime"],
+            snapshot["selected_mission"],
+            machine_label,
+            state.selected_role,
+            colors,
+            int(time.time() * 4),
+        )
+    else:
+        _draw_buddy(
+            stdscr,
+            layout.top,
+            layout.left_width + layout.center_width + 2,
+            layout.main_height,
+            layout.right_width,
+            snapshot["review"],
+            snapshot["memory"],
+            colors,
+            int(time.time() * 4),
+        )
+    if layout.timeline_height > 0:
+        _draw_timeline(
+            stdscr,
+            layout.top + layout.main_height,
+            0,
+            layout.timeline_height,
+            layout.width,
+            snapshot["events"],
+            snapshot["persona_lines"],
+            snapshot["decision_lines"],
+            colors,
+        )
+    _draw_status_and_prompt(
+        stdscr,
+        layout.height,
+        layout.width,
+        flash=state.flash,
+        flash_until=state.flash_until,
+        input_mode=state.input_mode,
+        input_buffer=state.input_buffer,
+        capture_state=state.capture_state,
+        snapshot=snapshot,
+        selected_machine_label=machine_label,
+        selected_role=state.selected_role,
+        colors=colors,
+    )
+    stdscr.refresh()
+    return layout
+
+
+def _handle_input_mode_key(
+    key: int,
+    state: TuiState,
+    snapshot: dict[str, Any],
+    local_session: str,
+    machine_session: str,
+    runtime_height: int,
+) -> dict[str, Any] | None:
+    if key in (10, 13, curses.KEY_ENTER):
+        candidates = _skill_menu_candidates(state.input_buffer)
+        if _slash_menu_pending(state.input_buffer) and candidates:
+            selected = candidates[max(0, min(state.slash_menu_index, len(candidates) - 1))]
+            state.input_buffer = _complete_slash_skill(state.input_buffer, selected)
+            state.slash_menu_index = 0
+            state.set_flash(f"selected /{selected['id']}", 1.5)
+            return None
+        outcome = _process_chat_submission(
+            state.input_buffer,
+            snapshot,
+            state.selected_machine,
+            state.selected_role,
+            local_session,
+            machine_session,
+            runtime_height,
+        )
+        state.input_mode = True
+        state.input_buffer = ""
+        stream_text = outcome.get("stream_text", "")
+        if stream_text:
+            state.stream_text = stream_text
+            state.stream_started_at = time.time()
+            state.stream_duration = min(3.8, max(0.7, len(stream_text) / 72.0))
+            state.stream_mission_id = outcome.get("stream_mission_id")
+        else:
+            state.stream_text = ""
+            state.stream_duration = 0.0
+            state.stream_mission_id = None
+        if outcome["capture_state"] is not None:
+            state.capture_state = outcome["capture_state"]
+        if outcome["invalidate_runtime"]:
+            state.runtime_cache = None
+        if outcome["force_select_mission_id"]:
+            state.pending_select_mission_id = outcome["force_select_mission_id"]
+        state.set_flash(outcome["flash"], 3.0)
+        return outcome["next_action"]
+    if key == 27:
+        state.input_mode = False
+        state.input_buffer = ""
+        state.slash_menu_index = 0
+        state.set_flash("chat canceled", 1.5)
+        return None
+    candidates = _skill_menu_candidates(state.input_buffer)
+    if candidates and key in (9, curses.KEY_DOWN):
+        state.slash_menu_index = (state.slash_menu_index + 1) % len(candidates)
+        return None
+    if candidates and key == curses.KEY_UP:
+        state.slash_menu_index = (state.slash_menu_index - 1) % len(candidates)
+        return None
+    if key in (curses.KEY_BACKSPACE, 127, 8):
+        state.input_buffer = state.input_buffer[:-1]
+        state.slash_menu_index = 0
+        return None
+    if key == 21:
+        state.input_buffer = ""
+        state.slash_menu_index = 0
+        return None
+    if 32 <= key <= 126:
+        state.input_buffer += chr(key)
+        state.slash_menu_index = 0
+    return None
+
+
+def _handle_capture_key(key: int, state: TuiState, machine_session: str, runtime_height: int) -> bool:
+    if not state.capture_state:
+        return False
+    if key == ord("x"):
+        state.capture_state = None
+        state.set_flash("capture view closed", 1.5)
+        return True
+    if key == ord("c"):
+        try:
+            state.capture_state = _open_capture(
+                state.capture_state["machine"],
+                state.capture_state["pane"],
+                machine_session,
+                runtime_height,
+                state.capture_state.get("scroll"),
+            )
+            if state.capture_state.get("returncode"):
+                state.set_flash(
+                    f"capture error for {state.capture_state['machine']}:{state.capture_state['pane']}",
+                    2.5,
+                )
+            else:
+                state.set_flash(
+                    f"capture refreshed for {state.capture_state['machine']}:{state.capture_state['pane']}",
+                    2.5,
+                )
+        except Exception as exc:  # noqa: BLE001
+            state.set_flash(_error_line("capture refresh failed", exc), 2.5)
+        return True
+    if key in (ord("j"), curses.KEY_DOWN):
+        max_scroll = max(0, len(state.capture_state.get("lines", [])) - max(1, runtime_height - 3))
+        state.capture_state["scroll"] = min(max_scroll, state.capture_state.get("scroll", 0) + 1)
+        return True
+    if key in (ord("k"), curses.KEY_UP):
+        state.capture_state["scroll"] = max(0, state.capture_state.get("scroll", 0) - 1)
+        return True
+    if key == curses.KEY_NPAGE:
+        max_scroll = max(0, len(state.capture_state.get("lines", [])) - max(1, runtime_height - 3))
+        state.capture_state["scroll"] = min(max_scroll, state.capture_state.get("scroll", 0) + max(4, runtime_height // 2))
+        return True
+    if key == curses.KEY_PPAGE:
+        state.capture_state["scroll"] = max(0, state.capture_state.get("scroll", 0) - max(4, runtime_height // 2))
+        return True
+    if key == ord("/"):
+        state.input_mode = True
+        state.input_buffer = "/"
+        state.slash_menu_index = 0
+        return True
+    return False
+
+
+def _handle_normal_key(
+    key: int,
+    state: TuiState,
+    snapshot: dict[str, Any],
+    local_session: str,
+    machine_session: str,
+    runtime_height: int,
+) -> dict[str, Any] | None:
+    if key in (ord("q"), 27):
+        return {"action": "quit"}
+    if key == ord("/"):
+        state.input_mode = True
+        state.input_buffer = "/"
+        state.slash_menu_index = 0
+        return None
+    if key == ord("f"):
+        state.chat_focus = not state.chat_focus
+        state.set_flash("chat-focus enabled" if state.chat_focus else "cockpit-detail enabled", 1.5)
+        return None
+    if key == ord("p"):
+        state.input_mode = True
+        state.input_buffer = "/spec-planner "
+        state.slash_menu_index = 0
+        state.set_flash("spec-planner primed", 1.5)
+        return None
+    if key == ord("b"):
+        state.input_mode = True
+        state.input_buffer = "/architecture-brainstorm "
+        state.slash_menu_index = 0
+        state.set_flash("architecture-brainstorm primed", 1.5)
+        return None
+    if key == ord("t"):
+        state.input_mode = True
+        state.input_buffer = "/task-decomposer "
+        state.slash_menu_index = 0
+        state.set_flash("task-decomposer primed", 1.5)
+        return None
+    if key == ord("P"):
+        state.input_mode = True
+        state.input_buffer = "/pr-review-prep "
+        state.slash_menu_index = 0
+        state.set_flash("pr-review-prep primed", 1.5)
+        return None
+    if 32 <= key <= 126 and chr(key) not in {"[", "]", "1", "2", "3", "4", "o", "r", "x", "z", "j", "k", "q", "e", "s", "c", "/", "p", "b", "t", "P", "f"}:
+        state.input_mode = True
+        state.input_buffer = chr(key)
+        return None
+
+    machines = snapshot["runtime"].get("machines", [])
+    machine_label = _selected_machine_label(snapshot, state.selected_machine)
+
+    if key in (ord("j"), curses.KEY_DOWN):
+        if snapshot["missions"]:
+            state.selected_index = min(len(snapshot["missions"]) - 1, state.selected_index + 1)
+        return None
+    if key in (ord("k"), curses.KEY_UP):
+        if snapshot["missions"]:
+            state.selected_index = max(0, state.selected_index - 1)
+        return None
+    if key == ord("["):
+        if machines:
+            state.selected_machine = max(0, state.selected_machine - 1)
+        return None
+    if key == ord("]"):
+        if machines:
+            state.selected_machine = min(len(machines) - 1, state.selected_machine + 1)
+        return None
+    if key in (ord("1"), ord("2"), ord("3"), ord("4")) and machines:
+        state.selected_role_index = int(chr(key)) - 1
+        state.set_flash(f"selected {machine_label}:{state.selected_role}", 1.5)
+        return None
+    if key == ord("o") and machines:
+        machine = machines[state.selected_machine]
+        try:
+            focus_machine(
+                machine["label"],
+                state.selected_role,
+                local_session=local_session,
+                machine_session=machine_session,
+            )
+            state.runtime_cache = None
+            state.set_flash(f"focused {machine['label']}:{state.selected_role}", 2.5)
+        except Exception as exc:  # noqa: BLE001
+            state.set_flash(_error_line("focus failed", exc), 2.5)
+        return None
+    if key == ord("r") and machines:
+        machine = machines[state.selected_machine]
+        try:
+            restart_pane(machine["label"], state.selected_role, machine_session=machine_session)
+            state.runtime_cache = None
+            state.set_flash(f"restart sent to {machine['label']}:{state.selected_role}", 2.5)
+        except Exception as exc:  # noqa: BLE001
+            state.set_flash(_error_line("restart failed", exc), 2.5)
+        return None
+    if key == ord("x") and machines:
+        machine = machines[state.selected_machine]
+        try:
+            state.capture_state = _open_capture(machine["label"], state.selected_role, machine_session, runtime_height)
+            if state.capture_state.get("returncode"):
+                state.set_flash(f"capture error for {machine['label']}:{state.selected_role}", 2.5)
+            else:
+                state.set_flash(f"capture loaded for {machine['label']}:{state.selected_role}", 2.5)
+        except Exception as exc:  # noqa: BLE001
+            state.set_flash(_error_line("capture failed", exc), 2.5)
+        return None
+    if key == ord("z"):
+        return {"action": "cockpit", "workspace": snapshot["workspace"]}
+    if key == ord("e"):
+        try:
+            rebuild_workspace_memory(snapshot["workspace"], enroll=True)
+            state.set_flash(f"memory rebuilt for {snapshot['workspace']}", 2.5)
+        except Exception as exc:  # noqa: BLE001
+            state.set_flash(_error_line("memory rebuild failed", exc), 2.5)
+        return None
+    if key == ord("s") and snapshot["selected_mission"]:
+        try:
+            summarize_mission(snapshot["selected_mission"]["mission_id"])
+            state.set_flash(f"mission summarized: {snapshot['selected_mission']['mission_id']}", 2.5)
+        except Exception as exc:  # noqa: BLE001
+            state.set_flash(_error_line("summary failed", exc), 2.5)
+        return None
+    return None
 
 
 def _run(stdscr: Any, workspace: str, local_session: str, machine_session: str) -> dict[str, Any] | None:
     try:
-        curses.curs_set(0)
+        curses.curs_set(1)
     except curses.error:
         pass
     stdscr.nodelay(False)
     stdscr.timeout(250)
     colors = _init_colors()
-    selected_index = 0
-    selected_machine = 0
-    selected_role_index = 1
-    flash = ""
-    flash_until = 0.0
-    runtime_cache: dict[str, Any] | None = None
-    runtime_refresh_at = 0.0
+    state = TuiState()
 
     while True:
-        now = time.time()
-        if runtime_cache is None or now >= runtime_refresh_at:
-            runtime_cache = _safe_runtime_status(local_session, machine_session)
-            runtime_refresh_at = now + 2.0
-        snapshot = _collect_snapshot(workspace, selected_index, local_session, machine_session, runtime_snapshot=runtime_cache)
-        selected_index = snapshot["selected_index"]
-        runtime_machines = snapshot["runtime"].get("machines", [])
-        if runtime_machines:
-            selected_machine = max(0, min(selected_machine, len(runtime_machines) - 1))
-        else:
-            selected_machine = 0
-        stdscr.erase()
-        height, width = stdscr.getmaxyx()
+        snapshot = _refresh_snapshot(state, workspace, local_session, machine_session)
+        layout = _draw_frame(stdscr, snapshot, state, colors)
 
-        _draw_header(
-            stdscr,
-            snapshot["workspace"],
-            len(snapshot["missions"]),
-            snapshot["fleet_count"],
-            snapshot["runtime"],
-            snapshot["memory"],
-            snapshot["health"],
-            colors,
-        )
-
-        top = 4
-        timeline_height = min(10, max(7, height // 4))
-        main_height = max(10, height - top - timeline_height - 1)
-        left_width = max(28, min(34, width // 4))
-        right_width = max(34, min(42, width // 3))
-        center_width = max(28, width - left_width - right_width - 4)
-        board_height = max(8, int(main_height * 0.52))
-        runtime_height = max(6, main_height - board_height)
-
-        _draw_missions(stdscr, top, 0, main_height, left_width, snapshot["missions"], selected_index, colors)
-        _draw_board(stdscr, top, left_width + 1, board_height, center_width, snapshot["selected_mission"], colors)
-        _draw_runtime(
-            stdscr,
-            top + board_height,
-            left_width + 1,
-            runtime_height,
-            center_width,
-            snapshot["runtime"],
-            selected_machine,
-            ROLES[selected_role_index],
-            colors,
-        )
-        _draw_buddy(stdscr, top, left_width + center_width + 2, main_height, right_width, snapshot["review"], snapshot["memory"], colors)
-        _draw_timeline(stdscr, top + main_height, 0, timeline_height, width, snapshot["events"], snapshot["persona_lines"], snapshot["decision_lines"], colors)
-
-        if flash and time.time() < flash_until:
-            _safe_addstr(stdscr, height - 1, 2, _clip(flash, width - 4), colors["warn"])
-        else:
-            flash = ""
-            _safe_addstr(stdscr, height - 1, 2, "q quit | j/k mission | [/] machine | 1..4 pane | o jump | r restart | x capture | z open cockpit", colors["muted"])
-
-        stdscr.refresh()
         key = stdscr.getch()
-        if key == -1:
+        if key in (-1, curses.KEY_RESIZE):
             continue
-        if key in (ord("q"), 27):
+
+        if state.input_mode:
+            next_action = _handle_input_mode_key(
+                key,
+                state,
+                snapshot,
+                local_session,
+                machine_session,
+                layout.runtime_height,
+            )
+            if next_action:
+                return next_action
+            continue
+
+        if _handle_capture_key(key, state, machine_session, layout.runtime_height):
+            continue
+
+        action = _handle_normal_key(
+            key,
+            state,
+            snapshot,
+            local_session,
+            machine_session,
+            layout.runtime_height,
+        )
+        if action and action.get("action") == "quit":
             return None
-        if key in (ord("j"), curses.KEY_DOWN):
-            if snapshot["missions"]:
-                selected_index = min(len(snapshot["missions"]) - 1, selected_index + 1)
-            continue
-        if key in (ord("k"), curses.KEY_UP):
-            if snapshot["missions"]:
-                selected_index = max(0, selected_index - 1)
-            continue
-        if key == ord("["):
-            if snapshot["runtime"]["machines"]:
-                selected_machine = max(0, selected_machine - 1)
-            continue
-        if key == ord("]"):
-            if snapshot["runtime"]["machines"]:
-                selected_machine = min(len(snapshot["runtime"]["machines"]) - 1, selected_machine + 1)
-            continue
-        if key in (ord("1"), ord("2"), ord("3"), ord("4")) and snapshot["runtime"]["machines"]:
-            selected_role_index = int(chr(key)) - 1
-            machine = snapshot["runtime"]["machines"][selected_machine]
-            try:
-                focus_machine(
-                    machine["label"],
-                    ROLES[selected_role_index],
-                    local_session=local_session,
-                    machine_session=machine_session,
-                )
-                runtime_cache = None
-                flash = f"focused {machine['label']}:{ROLES[selected_role_index]}"
-            except Exception as exc:  # noqa: BLE001
-                flash = _error_line("focus failed", exc)
-            flash_until = time.time() + 2.5
-            continue
-        if key == ord("o") and snapshot["runtime"]["machines"]:
-            machine = snapshot["runtime"]["machines"][selected_machine]
-            try:
-                focus_machine(machine["label"], None, local_session=local_session, machine_session=machine_session)
-                runtime_cache = None
-                flash = f"jumped to {machine['label']}"
-            except Exception as exc:  # noqa: BLE001
-                flash = _error_line("jump failed", exc)
-            flash_until = time.time() + 2.5
-            continue
-        if key == ord("r") and snapshot["runtime"]["machines"]:
-            machine = snapshot["runtime"]["machines"][selected_machine]
-            try:
-                restart_pane(machine["label"], ROLES[selected_role_index], machine_session=machine_session)
-                runtime_cache = None
-                flash = f"restarted {machine['label']}:{ROLES[selected_role_index]}"
-            except Exception as exc:  # noqa: BLE001
-                flash = _error_line("restart failed", exc)
-            flash_until = time.time() + 2.5
-            continue
-        if key == ord("x") and snapshot["runtime"]["machines"]:
-            machine = snapshot["runtime"]["machines"][selected_machine]
-            try:
-                capture = capture_pane(machine["label"], ROLES[selected_role_index], lines=12, machine_session=machine_session)
-                preview = (capture.get("stdout") or "").splitlines()[-1:] or ["(empty capture)"]
-                flash = f"{machine['label']}:{ROLES[selected_role_index]} :: {preview[0]}"
-            except Exception as exc:  # noqa: BLE001
-                flash = _error_line("capture failed", exc)
-            flash_until = time.time() + 3.5
-            continue
-        if key == ord("z"):
-            return {"action": "cockpit", "workspace": snapshot["workspace"]}
-        if key == ord("e"):
-            try:
-                rebuild_workspace_memory(snapshot["workspace"], enroll=True)
-                flash = f"memory rebuilt for {snapshot['workspace']}"
-            except Exception as exc:  # noqa: BLE001
-                flash = _error_line("memory rebuild failed", exc)
-            flash_until = time.time() + 2.5
-            continue
-        if key == ord("s") and snapshot["selected_mission"]:
-            try:
-                summarize_mission(snapshot["selected_mission"]["mission_id"])
-                flash = f"mission summarized: {snapshot['selected_mission']['mission_id']}"
-            except Exception as exc:  # noqa: BLE001
-                flash = _error_line("summary failed", exc)
-            flash_until = time.time() + 2.5
-            continue
+        if action:
+            return action
 
 
 def run_tui(workspace: str, local_session: str = "constant-fleet", machine_session: str = "constant") -> dict[str, Any] | None:

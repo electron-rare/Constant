@@ -10,6 +10,17 @@ done
 script_dir="$(cd "$(dirname "$script_source")" && pwd -P)"
 source "$script_dir/constant-common.sh"
 
+shell_fallback() {
+    local reason="${1:-Claude pane ended.}"
+    local shell_bin="${SHELL:-/bin/bash}"
+    echo
+    echo "$reason"
+    echo "Keeping the pane alive in an interactive shell."
+    echo "Workspace: $workspace"
+    echo
+    exec "$shell_bin" -il
+}
+
 workspace="${ZELLIJ_AI_WORKSPACE:-$PWD}"
 machine_name="${ZELLIJ_AI_MACHINE_NAME:-unknown}"
 session_name="${ZELLIJ_AI_SESSION:-$(zellij_ai_default_session)}"
@@ -50,4 +61,11 @@ if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
 fi
 echo
 
-exec claude
+if ! command -v claude >/dev/null 2>&1; then
+    shell_fallback "Claude CLI not found on the host."
+fi
+
+if ! claude; then
+    rc=$?
+    shell_fallback "Claude exited with status ${rc}."
+fi

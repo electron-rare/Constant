@@ -112,14 +112,34 @@ def _machine_tmux_status(machine: dict[str, Any], session: str) -> dict[str, Any
 
 def runtime_status(local_session: str = "constant-fleet", machine_session: str = "constant") -> dict[str, Any]:
     fleet = load_fleet_config()
-    local_tmux = _run(["tmux", "list-windows", "-t", local_session, "-F", "#{window_name}"])
-    fleet_windows = local_tmux["stdout"].splitlines() if local_tmux["returncode"] == 0 else []
+    local_tmux = _run(["tmux", "list-windows", "-t", local_session, "-F", "#{window_name}\t#{window_active}"])
+    fleet_windows: list[str] = []
+    focused_machine = None
+    if local_tmux["returncode"] == 0:
+        for raw in local_tmux["stdout"].splitlines():
+            window_name, _, *rest = raw.split("\t") + [""]
+            active = raw.split("\t")[1] if "\t" in raw else "0"
+            fleet_windows.append(window_name)
+            if active == "1":
+                focused_machine = window_name
     machines = [_machine_tmux_status(machine, machine_session) for machine in fleet["machines"]]
+    focused_role = None
+    for machine in machines:
+        if machine["label"] != focused_machine:
+            continue
+        for role in ROLES:
+            pane = machine["roles"].get(role)
+            if pane and pane.get("active"):
+                focused_role = role
+                break
+        break
     return {
         "local_session": local_session,
         "machine_session": machine_session,
         "fleet_session_exists": local_tmux["returncode"] == 0,
         "fleet_windows": fleet_windows,
+        "focused_machine": focused_machine,
+        "focused_role": focused_role,
         "machines": machines,
         "fleet_stderr": local_tmux["stderr"].strip(),
     }
@@ -142,13 +162,18 @@ def _machine_control_script(machine_label: str, machine_session: str) -> tuple[d
     return machine, script
 
 
+def _machine_command_args(machine: dict[str, Any], args: list[str]) -> list[str]:
+    return ["env", f"ZELLIJ_AI_MACHINE_NAME={machine['label']}", *args]
+
+
 def _run_machine_command(machine: dict[str, Any], args: list[str]) -> dict[str, Any]:
+    command_args = _machine_command_args(machine, args)
     target = machine["target"]
     local_names = {socket.gethostname(), socket.getfqdn(), socket.gethostname().split(".")[0], "local", "localhost", "127.0.0.1", "::1"}
     if target in local_names:
-        return _run(args)
+        return _run(command_args)
 
-    quoted = shlex.join(args)
+    quoted = shlex.join(command_args)
     return _run(_ssh_command(target, quoted))
 
 

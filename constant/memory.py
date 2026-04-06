@@ -256,8 +256,11 @@ def _detect_repo_root(workspace: Path) -> Path:
 
 
 def _sanitize_fts_query(query: str) -> str:
-    tokens = re.findall(r"[A-Za-z0-9_.:/-]+", query.lower())
-    return " ".join(tokens[:12]) or "constant"
+    raw_tokens = re.findall(r"[A-Za-z0-9_]+", query.lower())
+    tokens = [token for token in raw_tokens if len(token) >= 2][:12]
+    if not tokens:
+        return "\"constant\""
+    return " ".join(f"\"{token}\"" for token in tokens)
 
 
 def _tokenize(text: str) -> list[str]:
@@ -820,7 +823,11 @@ def search_memory(query: str, workspace: str | None = None, limit: int | None = 
             params.append(workspace_path)
         chunk_sql += " order by rank limit ?"
         params.append(max_hits * 3)
-        for row in connection.execute(chunk_sql, tuple(params)).fetchall():
+        try:
+            rows = connection.execute(chunk_sql, tuple(params)).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        for row in rows:
             hits.append(
                 {
                     "kind": "repo",
@@ -914,6 +921,47 @@ def search_memory(query: str, workspace: str | None = None, limit: int | None = 
             "workspace": workspace_path,
             "hits": deduped,
         }
+    finally:
+        connection.close()
+
+
+def instruction_skill_sources(workspace: str | Path, query: str | None = None, limit: int = 6) -> list[dict[str, Any]]:
+    workspace_path = str(_normalize_workspace(workspace))
+    connection = _connect()
+    try:
+        rows = connection.execute(
+            """
+            select path, scope, source_kind, weight, content, updated_at
+            from instruction_sources
+            where workspace = ? or scope = 'user'
+            order by weight desc, updated_at desc
+            limit 64
+            """,
+            (workspace_path,),
+        ).fetchall()
+        hits: list[dict[str, Any]] = []
+        query_l = query.lower() if query else ""
+        query_tokens = _tokenize(query)[:6] if query else []
+        for row in rows:
+            path = row["path"]
+            score = float(row["weight"])
+            haystack = row["content"].lower()
+            if query:
+                matched = query_l in haystack or any(token in haystack for token in query_tokens) or any(token in path.lower() for token in query_tokens)
+                if not matched:
+                    continue
+                score += 1.0
+            hits.append(
+                {
+                    "path": path,
+                    "scope": row["scope"],
+                    "source_kind": row["source_kind"],
+                    "weight": score,
+                    "snippet": _snippet(row["content"], 160),
+                }
+            )
+        hits.sort(key=lambda item: item["weight"], reverse=True)
+        return hits[:limit]
     finally:
         connection.close()
 

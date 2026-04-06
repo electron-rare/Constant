@@ -3,17 +3,28 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .capabilities import (
+    agent_for_cli,
+    list_agents,
+    list_skills,
+    recommended_skill_stack,
+    resolve_skill_and_agent,
+    skill_catalog,
+    skill_by_id,
+)
 from .cockpit import capture_pane, cockpit_doctor, focus_machine, restart_pane, runtime_status, send_to_pane
 from .daemon import daemon_status, request as daemon_request, serve_foreground, start_background, stop_background
 from .executors import bridge_sync, execute_step, fleet_check
 from .memory import (
     enroll_workspace,
+    instruction_skill_sources,
     list_decisions,
     memory_status,
     persona_markdown,
@@ -54,6 +65,96 @@ def _command_exists(binary: str) -> bool:
         if candidate.exists() and os.access(candidate, os.X_OK):
             return True
     return False
+
+
+def _read_wrapper_stamp(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    parts = raw.split()
+    if len(parts) < 2:
+        return {"raw": raw}
+    signature, epoch_text = parts[0], parts[1]
+    payload: dict[str, Any] = {"signature": signature, "epoch": epoch_text}
+    try:
+        payload["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(epoch_text)))
+    except ValueError:
+        pass
+    return payload
+
+
+def _read_wrapper_mode(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    parts = raw.split()
+    if len(parts) < 3:
+        return {"raw": raw}
+    mode, reason, epoch_text = parts[0], parts[1], parts[2]
+    payload: dict[str, Any] = {"mode": mode, "reason": reason, "epoch": epoch_text}
+    try:
+        payload["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(epoch_text)))
+    except ValueError:
+        pass
+    return payload
+
+
+def _run_quick_command(command: list[str]) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "command": command}
+    return {
+        "ok": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout.strip(),
+        "stderr": completed.stderr.strip(),
+        "command": command,
+    }
+
+
+def _wrapper_status() -> dict[str, Any]:
+    wrapper_dir = cache_root() / "wrapper"
+    rust_bin = repo_root() / "target" / "debug" / "constant"
+    payload: dict[str, Any] = {
+        "wrapper_dir": str(wrapper_dir),
+        "rust_bin": str(rust_bin),
+        "rust_bin_exists": rust_bin.exists(),
+        "forced_python": os.environ.get("CONSTANT_USE_PYTHON") == "1",
+        "forced_rust": os.environ.get("CONSTANT_USE_RUST") == "1",
+        "force_recheck": os.environ.get("CONSTANT_RUST_RECHECK") == "1",
+        "last_mode": _read_wrapper_mode(wrapper_dir / "last-mode"),
+        "probe_timeout_sec": os.environ.get("CONSTANT_RUST_PROBE_TIMEOUT_SEC", "2"),
+        "probe_fail_ttl_sec": os.environ.get("CONSTANT_RUST_PROBE_FAIL_TTL_SEC", "300"),
+        "cache": {
+            "rust_ok": _read_wrapper_stamp(wrapper_dir / "rust-ok"),
+            "rust_fail": _read_wrapper_stamp(wrapper_dir / "rust-fail"),
+        },
+    }
+    if rust_bin.exists():
+        payload["codesign_verify"] = _run_quick_command(
+            ["codesign", "--verify", "--verbose=2", str(rust_bin)]
+        )
+        payload["spctl_assess"] = _run_quick_command(["spctl", "--assess", "-vv", str(rust_bin)])
+        payload["xattr_provenance"] = _run_quick_command(["xattr", "-p", "com.apple.provenance", str(rust_bin)])
+    payload["hint"] = (
+        "If spctl reports a Code Signing subsystem error from a normal terminal, allow that terminal in "
+        "System Settings -> Privacy & Security -> Developer Tools. Then rerun with CONSTANT_RUST_RECHECK=1 "
+        "to force a fresh startup probe."
+    )
+    return payload
 
 
 def _warm_memory(workspace: str) -> dict[str, Any] | None:
@@ -99,6 +200,9 @@ def _mission_summary(mission: dict[str, Any]) -> dict[str, Any]:
                 "backend": step["backend"],
                 "cli": step["cli"],
                 "agent": step["agent"],
+                "agent_role": step.get("agent_role"),
+                "skill": step.get("skill"),
+                "skill_summary": step.get("skill_summary"),
                 "attempt": step["attempt"],
             }
             for step in mission["steps"]
@@ -133,6 +237,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "memory": memory_status(),
         "fleet": [{"label": entry["label"], "target": entry["target"]} for entry in fleet["machines"]],
         "cockpit": cockpit,
+        "wrapper": _wrapper_status(),
     }
     _print(report, args.json)
     return 0
@@ -174,6 +279,24 @@ def cmd_models_status(args: argparse.Namespace) -> int:
     payload = {"config": load_models_config(), "daemon": daemon_status(), "health": daemon_request("health", auto_start=False)}
     if not payload["daemon"]["running"]:
         payload["mode"] = "inline-fallback"
+    _print(payload, args.json)
+    return 0
+
+
+def cmd_agents(args: argparse.Namespace) -> int:
+    payload = {"agents": list_agents(), "recommended_skill_stack": recommended_skill_stack()}
+    _print(payload, args.json)
+    return 0
+
+
+def cmd_skills(args: argparse.Namespace) -> int:
+    payload = {
+        "skills": list_skills(include_internal=not getattr(args, "public_only", False)),
+        "catalog": skill_catalog(include_internal=not getattr(args, "public_only", False)),
+        "recommended_skill_stack": recommended_skill_stack(),
+    }
+    if getattr(args, "workspace", None):
+        payload["instruction_skill_sources"] = instruction_skill_sources(args.workspace)
     _print(payload, args.json)
     return 0
 
@@ -491,14 +614,38 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         step["machine"] = args.machine
     if args.backend:
         step["backend"] = args.backend
-    if args.cli:
-        step["cli"] = args.cli
-    if args.agent:
-        step["agent"] = args.agent
+    if args.skill or args.agent or args.cli:
+        resolved_cli = args.cli
+        resolved_agent = args.agent
+        if not args.skill and not resolved_cli:
+            resolved_cli = step.get("cli")
+        if not args.skill and not resolved_agent:
+            resolved_agent = step.get("agent")
+        resolved = resolve_skill_and_agent(
+            goal=step.get("prompt") or mission.get("goal", ""),
+            skill_id=args.skill or step.get("skill"),
+            agent_id=resolved_agent,
+            cli=resolved_cli,
+        )
+        step["skill"] = resolved["skill"]["id"]
+        step["skill_summary"] = resolved["skill"]["summary"]
+        step["agent"] = resolved["agent"]["id"]
+        step["agent_role"] = resolved["agent"]["role"]
+        step["cli"] = resolved["cli"]
+    elif step.get("cli") and not step.get("agent"):
+        agent = agent_for_cli(step["cli"])
+        step["agent"] = agent["id"]
+        step["agent_role"] = agent["role"]
+
+    if step.get("skill"):
+        try:
+            step["skill_summary"] = skill_by_id(step["skill"])["summary"]
+        except KeyError:
+            pass
     step["status"] = "pending"
     mission["status"] = "planned"
     save_mission(mission)
-    append_event(mission["mission_id"], "step.delegated", {"step_id": step["step_id"], "machine": step["machine"], "backend": step["backend"], "cli": step["cli"], "agent": step["agent"]})
+    append_event(mission["mission_id"], "step.delegated", {"step_id": step["step_id"], "machine": step["machine"], "backend": step["backend"], "cli": step["cli"], "agent": step["agent"], "skill": step.get("skill")})
     _print(_mission_summary(mission), args.json)
     return 0
 
@@ -557,7 +704,7 @@ def cmd_mission_summarize(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="Constant")
+    parser = argparse.ArgumentParser(prog=os.environ.get("CONSTANT_PROG_NAME", "Constant"))
     parser.add_argument("-V", "--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -588,6 +735,16 @@ def build_parser() -> argparse.ArgumentParser:
     models_status = models_sub.add_parser("status")
     models_status.add_argument("--json", action="store_true")
     models_status.set_defaults(func=cmd_models_status)
+
+    agents = subparsers.add_parser("agents")
+    agents.add_argument("--json", action="store_true")
+    agents.set_defaults(func=cmd_agents)
+
+    skills = subparsers.add_parser("skills")
+    skills.add_argument("--workspace")
+    skills.add_argument("--public-only", action="store_true")
+    skills.add_argument("--json", action="store_true")
+    skills.set_defaults(func=cmd_skills)
 
     fleet = subparsers.add_parser("fleet")
     fleet_sub = fleet.add_subparsers(dest="fleet_command", required=True)
@@ -715,6 +872,7 @@ def build_parser() -> argparse.ArgumentParser:
     delegate.add_argument("--backend")
     delegate.add_argument("--cli")
     delegate.add_argument("--agent")
+    delegate.add_argument("--skill")
     delegate.add_argument("--json", action="store_true")
     delegate.set_defaults(func=cmd_delegate)
 
@@ -773,7 +931,7 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
     if not argv:
         if sys.stdin.isatty() and sys.stdout.isatty():
-            argv = ["tui", "--workspace", os.getcwd()]
+            argv = ["cockpit", "open", "--workspace", os.getcwd()]
         else:
             argv = ["doctor"]
     parser = build_parser()

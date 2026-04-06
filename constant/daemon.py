@@ -76,6 +76,15 @@ class _Handler(socketserver.StreamRequestHandler):
                 payload = self.engine.verify_step(request["mission"], request["step"], request["execution"])
             elif op == "buddy":
                 payload = self.engine.buddy_ask(request.get("mission"), request["prompt"])
+            elif op == "chat":
+                payload = self.engine.chat(
+                    request["message"],
+                    request.get("mission"),
+                    request["workspace"],
+                    request.get("selected_machine"),
+                    request.get("selected_role"),
+                    request.get("chat_history"),
+                )
             else:
                 raise KeyError(f"Unsupported operation: {op}")
             response = {"ok": True, "payload": payload}
@@ -187,6 +196,15 @@ def _direct_request(op: str, payload: dict[str, Any] | None = None) -> dict[str,
         return _INLINE_ENGINE.buddy_ask(
             request_payload.get("mission"),
             request_payload["prompt"],
+        )
+    if op == "chat":
+        return _INLINE_ENGINE.chat(
+            request_payload["message"],
+            request_payload.get("mission"),
+            request_payload["workspace"],
+            request_payload.get("selected_machine"),
+            request_payload.get("selected_role"),
+            request_payload.get("chat_history"),
         )
     raise RuntimeError(f"Unsupported operation: {op}")
 

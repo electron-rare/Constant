@@ -8,6 +8,7 @@ zellij_ai_fleet_config_candidates() {
     if [[ -n "${CONSTANT_FLEET_CONFIG:-}" ]]; then
         printf '%s\n' "$CONSTANT_FLEET_CONFIG"
     fi
+    printf '%s\n' "$(zellij_ai_config_root)/fleet.toml"
     printf '%s\n' "$(zellij_ai_config_root)/fleet.json"
     printf '%s\n' "$(zellij_ai_config_root)/fleet.yaml"
 }
@@ -32,16 +33,26 @@ zellij_ai_fleet_config_query() {
     [[ -n "$config_path" ]] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
 
-    python3 - "$config_path" "$expr" <<'PY'
+python3 - "$config_path" "$expr" <<'PY'
 import json
 import sys
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None
 
 path = Path(sys.argv[1])
 expr = sys.argv[2]
 
 try:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    if path.suffix == ".toml":
+        if tomllib is None:
+            raise SystemExit(1)
+        payload = tomllib.loads(path.read_text(encoding="utf-8"))
+    else:
+        payload = json.loads(path.read_text(encoding="utf-8"))
 except Exception:
     raise SystemExit(1)
 

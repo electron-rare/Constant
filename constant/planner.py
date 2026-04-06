@@ -3,11 +3,26 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from typing import Any
 
+from .capabilities import (
+    agent_for_cli,
+    list_agents,
+    list_skills,
+    match_skill,
+    recommended_skill_stack,
+    resolve_skill_and_agent,
+    skill_by_id,
+    skill_catalog_brief,
+)
+from .memory import instruction_skill_sources, search_memory
 from .state import load_fleet_config, load_models_config
+
+CHAT_ROLES = ("claude", "codex", "copilot", "vibe")
 
 
 def _fleet_labels() -> dict[str, str]:
@@ -47,9 +62,72 @@ def _lower(value: str) -> str:
     return value.lower()
 
 
-def _route_machine(goal: str) -> str:
+def _public_skill_ids() -> list[str]:
+    return [item["id"] for item in list_skills(include_internal=False)]
+
+
+def _extract_explicit_skill(message: str) -> tuple[str, dict[str, Any] | None]:
+    raw = message.strip()
+    lowered = raw.lower()
+
+    if lowered.startswith("skill:"):
+        payload = raw[len("skill:") :].strip()
+        if payload:
+            parts = payload.split(maxsplit=1)
+            try:
+                skill = skill_by_id(parts[0], include_internal=False)
+            except KeyError:
+                skill = None
+            if skill:
+                remainder = parts[1].strip() if len(parts) > 1 else ""
+                return remainder or raw, skill
+
+    if lowered.startswith("/skill "):
+        payload = raw[len("/skill ") :].strip()
+        if payload:
+            parts = payload.split(maxsplit=1)
+            try:
+                skill = skill_by_id(parts[0], include_internal=False)
+            except KeyError:
+                skill = None
+            if skill:
+                remainder = parts[1].strip() if len(parts) > 1 else ""
+                return remainder or raw, skill
+
+    if raw.startswith("/"):
+        parts = raw[1:].split(maxsplit=1)
+        if parts:
+            try:
+                skill = skill_by_id(parts[0], include_internal=False)
+            except KeyError:
+                skill = None
+            if skill:
+                remainder = parts[1].strip() if len(parts) > 1 else ""
+                return remainder or raw, skill
+
+    for skill_id in _public_skill_ids():
+        token = skill_id.lower()
+        if token in lowered:
+            try:
+                return raw, skill_by_id(skill_id, include_internal=False)
+            except KeyError:
+                continue
+    return raw, None
+
+
+def _route_machine(goal: str, skill_id: str | None = None) -> str:
     labels = _fleet_labels()
     goal_l = _lower(goal)
+    if skill_id in {"spec-planner", "repo-onboarding", "task-decomposer"}:
+        return labels["local"]
+    if skill_id == "architecture-brainstorm":
+        return labels["lab_a"]
+    if skill_id == "pr-review-prep":
+        return labels["builder_a"]
+    if skill_id == "ops-deployment":
+        return labels["edge_a"]
+    if skill_id == "debug-restoration" and any(token in goal_l for token in ("performance", "deep", "benchmark", "compiler", "cuda")):
+        return labels["builder_b"]
     if any(token in goal_l for token in ("ssh", "shell", "fleet", "ops", "network", "infra")):
         return labels["edge_a"]
     if any(token in goal_l for token in ("refactor", "performance", "deep", "cuda", "compiler", "benchmark")):
@@ -62,6 +140,9 @@ def _route_machine(goal: str) -> str:
 
 
 def _route_cli(goal: str) -> str:
+    skill = match_skill(goal)
+    if skill.get("preferred_cli"):
+        return str(skill["preferred_cli"])
     goal_l = _lower(goal)
     if any(token in goal_l for token in ("brainstorm", "idea", "alternative", "explore", "compare")):
         return "vibe"
@@ -81,21 +162,26 @@ def _route_backend(machine: str, cli: str, goal: str) -> str:
 
 
 def _route_agent(cli: str) -> str:
-    return {
-        "claude": "planner",
-        "codex": "executor",
-        "vibe": "analyst",
-        "copilot": "assistant",
-    }.get(cli, "executor")
+    return agent_for_cli(cli)["id"]
 
 
-def _heuristic_plan(goal: str, workspace: str, mission_id: str) -> dict[str, Any]:
-    machine = _route_machine(goal)
-    cli = _route_cli(goal)
-    backend = _route_backend(machine, cli, goal)
+def _heuristic_plan(goal: str, workspace: str, mission_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    overrides = overrides or {}
+    resolved = resolve_skill_and_agent(
+        goal=goal,
+        skill_id=overrides.get("skill"),
+        agent_id=overrides.get("agent"),
+        cli=overrides.get("cli"),
+    )
+    skill = resolved["skill"]
+    cli = str(resolved["cli"])
+    agent = resolved["agent"]
+    machine = str(overrides.get("machine") or _route_machine(goal, str(skill["id"])))
+    backend = str(overrides.get("backend") or _route_backend(machine, cli, goal))
+    skill_sources = instruction_skill_sources(workspace, query=goal, limit=4) if workspace else []
     return {
         "title": goal.strip().splitlines()[0][:80] or mission_id,
-        "summary": f"Route the mission to {machine} using {cli} via {backend}.",
+        "summary": f"Route the mission to {machine} using {cli} via {backend} for skill {skill['id']}.",
         "steps": [
             {
                 "step_id": "step-1",
@@ -105,7 +191,11 @@ def _heuristic_plan(goal: str, workspace: str, mission_id: str) -> dict[str, Any
                 "machine": machine,
                 "backend": backend,
                 "cli": cli,
-                "agent": _route_agent(cli),
+                "agent": agent["id"],
+                "agent_role": agent["role"],
+                "skill": skill["id"],
+                "skill_summary": skill["summary"],
+                "skill_sources": [item["path"] for item in skill_sources],
                 "status": "pending",
                 "attempt": 0,
                 "depends_on": [],
@@ -187,10 +277,156 @@ def _heuristic_verify(step: dict[str, Any], execution: dict[str, Any]) -> dict[s
 
 def _heuristic_buddy_answer(prompt: str, mission: dict[str, Any] | None) -> dict[str, Any]:
     title = mission["title"] if mission else "mission"
+    skill = match_skill(prompt)
     return {
-        "answer": f"Qwen buddy heuristic view for {title}: focus on route correctness, CLI fit, and whether codex should own the technical step. Prompt: {prompt}",
+        "answer": (
+            f"Qwen buddy heuristic view for {title}: "
+            f"skill={skill['id']}, focus on route correctness, CLI fit, and whether the selected agent matches the workflow stage. "
+            f"Prompt: {prompt}"
+        ),
         "mode": "heuristic",
     }
+
+
+def _match_machine_label(message: str) -> str | None:
+    message_l = _lower(message)
+    for machine in load_fleet_config()["machines"]:
+        label = machine["label"]
+        if label.lower() in message_l:
+            return label
+    return None
+
+
+def _match_role(message: str) -> str | None:
+    message_l = _lower(message)
+    for role in CHAT_ROLES:
+        if role in message_l:
+            return role
+    return None
+
+
+def _heuristic_chat(
+    message: str,
+    mission: dict[str, Any] | None,
+    workspace: str,
+    selected_machine: str | None,
+    selected_role: str | None,
+) -> dict[str, Any]:
+    prompt, explicit_skill = _extract_explicit_skill(message)
+    prompt = prompt.strip()
+    prompt_l = _lower(prompt)
+    memory_hits = search_memory(prompt, workspace=workspace, limit=4).get("hits", []) if workspace else []
+    skill_sources = instruction_skill_sources(workspace, query=prompt, limit=4) if workspace else []
+    memory_lines = [f"{hit['kind']} {hit['path']} :: {hit['snippet']}" for hit in memory_hits[:3]]
+    buddy_note = None
+    cockpit_action: dict[str, Any] | None = None
+    intent = "plain_chat"
+
+    target_machine = _match_machine_label(prompt) or selected_machine or _fleet_labels()["local"]
+    target_role = _match_role(prompt) or selected_role or "codex"
+    matched_skill = explicit_skill or (match_skill(prompt) if prompt else None)
+
+    if any(token in prompt_l for token in ("open cockpit", "attach cockpit", "show cockpit")):
+        intent = "cockpit_open"
+        cockpit_action = {"type": "open"}
+        reply = "I can hand off to the full cockpit now."
+    elif any(token in prompt_l for token in ("restart", "relance", "respawn")):
+        intent = "cockpit_restart"
+        cockpit_action = {"type": "restart", "machine": target_machine, "pane": target_role}
+        reply = f"I'll restart {target_machine}:{target_role}."
+    elif any(token in prompt_l for token in ("capture", "log", "logs", "show pane", "see pane")):
+        intent = "cockpit_capture"
+        cockpit_action = {"type": "capture", "machine": target_machine, "pane": target_role}
+        reply = f"I'll capture {target_machine}:{target_role}."
+    elif any(token in prompt_l for token in ("focus", "jump", "go to", "ouvre", "open machine")):
+        intent = "cockpit_focus"
+        cockpit_action = {"type": "focus", "machine": target_machine, "pane": target_role}
+        reply = f"I'll focus {target_machine}:{target_role}."
+    elif any(token in prompt_l for token in ("memory", "remember", "decision", "persona", "what do we know", "qu'est-ce qu", "souviens")):
+        intent = "memory_lookup"
+        reply = "Memory lookup ready."
+    elif explicit_skill is None and prompt.endswith("?") and not any(
+        token in prompt_l for token in ("fix", "build", "implement", "write", "create", "deploy", "restart", "capture", "focus")
+    ):
+        intent = "plain_chat"
+        reply = "Here's the operator view."
+    else:
+        intent = "mission_create"
+        routing_overrides = {
+            "skill": matched_skill["id"] if matched_skill else None,
+            "agent": matched_skill["preferred_agent"] if matched_skill else None,
+            "cli": matched_skill["preferred_cli"] if matched_skill else None,
+        }
+        preview = _heuristic_plan(prompt, workspace, "chat-preview", routing_overrides)
+        review = _heuristic_buddy_review(prompt, preview)
+        step = preview["steps"][0]
+        buddy_note = {
+            "answer": review["summary"],
+            "mode": "heuristic",
+        }
+        matched_skill_id = preview["steps"][0]["skill"]
+        reply = (
+            f"I turned that into a mission. Route preview: "
+            f"{step['machine']}/{step['cli']}/{step['backend']} "
+            f"skill={matched_skill_id} agent={step['agent']}."
+        )
+
+    if intent != "mission_create" and any(
+        token in prompt_l for token in ("route", "reroute", "which machine", "which cli", "codex", "claude", "vibe", "copilot")
+    ):
+        buddy_note = _heuristic_buddy_answer(prompt, mission)
+
+    if intent == "memory_lookup":
+        if memory_lines:
+            reply = "Memory echoes:\n- " + "\n- ".join(memory_lines[:3])
+        else:
+            reply = "No strong memory hits for that query yet."
+    elif intent == "plain_chat":
+        title = mission["title"] if mission else "global cockpit"
+        route_hint = f" selected={selected_machine or '-'}:{selected_role or '-'}"
+        reply = f"Constant view for {title}.{route_hint}"
+        if memory_lines:
+            reply += "\nMemory echoes:\n- " + "\n- ".join(memory_lines[:2])
+
+    return {
+        "intent": intent,
+        "reply": reply,
+        "message": prompt,
+        "mode": "heuristic",
+        "cockpit_action": cockpit_action,
+        "buddy_note": buddy_note,
+        "memory_hits": memory_hits,
+        "skill_sources": skill_sources,
+        "workspace": workspace,
+        "mission_goal": prompt if intent == "mission_create" else None,
+        "skill": matched_skill,
+        "routing_overrides": {
+            "skill": matched_skill["id"] if matched_skill else None,
+            "agent": matched_skill["preferred_agent"] if matched_skill else None,
+            "cli": matched_skill["preferred_cli"] if matched_skill else None,
+        }
+        if intent == "mission_create" and matched_skill
+        else {},
+    }
+
+
+def _budget_chat_history(chat_history: list[dict[str, Any]] | None, limit: int = 8) -> list[dict[str, Any]]:
+    if not chat_history:
+        return []
+    important = [
+        entry for entry in chat_history
+        if entry.get("intent") in {"mission_create", "cockpit_error", "buddy_answer", "memory_lookup"}
+    ]
+    recent = list(chat_history[-limit:])
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in [*important[-3:], *recent]:
+        key = (str(entry.get("timestamp", "")), str(entry.get("content", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(entry)
+    return merged[-limit:]
 
 
 @dataclass
@@ -207,7 +443,30 @@ class PlannerEngine:
         self._models = load_models_config()
         self._loaded: dict[str, tuple[Any, Any]] = {}
         self._lock = threading.Lock()
-        self._mlx_python = importlib.util.find_spec("mlx_lm") is not None
+        self._mlx_probe = self._probe_mlx()
+        self._mlx_python = self._mlx_probe["available"]
+
+    def _probe_mlx(self) -> dict[str, Any]:
+        enable_setting = self._models.get("enable_mlx", "auto")
+        requested = str(enable_setting).lower() not in {"0", "false", "off", "no"}
+        package_present = importlib.util.find_spec("mlx_lm") is not None
+        if not requested:
+            return {"requested": False, "package_present": package_present, "available": False, "reason": "disabled"}
+        if not package_present:
+            return {"requested": True, "package_present": False, "available": False, "reason": "mlx_lm not installed"}
+        probe = subprocess.run(
+            [sys.executable, "-c", "import mlx.core as mx; print(mx.default_device())"],
+            capture_output=True,
+            text=True,
+        )
+        return {
+            "requested": True,
+            "package_present": True,
+            "available": probe.returncode == 0,
+            "reason": probe.stderr.strip() or ("ok" if probe.returncode == 0 else "mlx probe failed"),
+            "stdout": probe.stdout.strip(),
+            "returncode": probe.returncode,
+        }
 
     def health(self) -> dict[str, Any]:
         health = {}
@@ -222,8 +481,12 @@ class PlannerEngine:
             ).__dict__
         return {
             "mlx_python": self._mlx_python,
+            "mlx_probe": self._mlx_probe,
             "models": health,
             "fallback_mode": self._models.get("fallback_mode", "heuristic"),
+            "agents": list_agents(),
+            "skills": list_skills(),
+            "recommended_skill_stack": recommended_skill_stack(),
         }
 
     def _load_model(self, role: str) -> tuple[Any, Any]:
@@ -285,7 +548,8 @@ class PlannerEngine:
         ).strip()
 
     def plan_mission(self, mission: dict[str, Any]) -> dict[str, Any]:
-        plan = _heuristic_plan(mission["goal"], mission["workspace"], mission["mission_id"])
+        overrides = mission.get("routing_overrides") or {}
+        plan = _heuristic_plan(mission["goal"], mission["workspace"], mission["mission_id"], overrides)
         review = _heuristic_buddy_review(mission["goal"], plan)
         fleet = load_fleet_config()
         machine_labels = [machine["label"] for machine in fleet["machines"]]
@@ -302,9 +566,11 @@ class PlannerEngine:
                     "mission_id": mission["mission_id"],
                     "goal": mission["goal"],
                     "workspace": mission["workspace"],
+                    "routing_overrides": overrides,
                     "machines": machine_labels,
                     "allowed_backends": ["omc", "cli-local", "cli-ssh", "cockpit"],
                     "allowed_clis": ["claude", "codex", "vibe"],
+                    "skill_catalog": skill_catalog_brief(include_internal=True),
                 },
                 indent=2,
             )
@@ -317,16 +583,30 @@ class PlannerEngine:
                         "steps": [],
                     }
                     for index, step in enumerate(llama_plan["steps"], start=1):
+                        resolved = resolve_skill_and_agent(
+                            goal=step.get("prompt", mission["goal"]),
+                            skill_id=step.get("skill") or overrides.get("skill"),
+                            agent_id=step.get("agent") or overrides.get("agent"),
+                            cli=step.get("cli") or overrides.get("cli"),
+                        )
+                        resolved_skill = resolved["skill"]
+                        resolved_agent = resolved["agent"]
+                        resolved_cli = str(resolved["cli"])
+                        resolved_machine = step.get("machine") or overrides.get("machine") or _route_machine(step.get("prompt", mission["goal"]), resolved_skill["id"])
                         plan["steps"].append(
                             {
                                 "step_id": step.get("step_id", f"step-{index}"),
                                 "kind": step.get("kind", "task"),
                                 "title": step.get("title", f"Step {index}"),
                                 "prompt": step.get("prompt", mission["goal"]),
-                                "machine": step.get("machine", _route_machine(mission["goal"])),
-                                "backend": step.get("backend", _route_backend(step.get("machine", local_machine), step.get("cli", "codex"), mission["goal"])),
-                                "cli": step.get("cli", _route_cli(mission["goal"])),
-                                "agent": step.get("agent", _route_agent(step.get("cli", "codex"))),
+                                "machine": resolved_machine,
+                                "backend": step.get("backend", _route_backend(resolved_machine, resolved_cli, mission["goal"])),
+                                "cli": resolved_cli,
+                                "agent": resolved_agent["id"],
+                                "agent_role": resolved_agent.get("role"),
+                                "skill": resolved_skill["id"],
+                                "skill_summary": step.get("skill_summary", resolved_skill["summary"]),
+                                "skill_sources": step.get("skill_sources", [item["path"] for item in instruction_skill_sources(mission["workspace"], query=step.get("prompt", mission["goal"]), limit=4)]),
                                 "status": "pending",
                                 "attempt": 0,
                                 "depends_on": step.get("depends_on", []),
@@ -354,7 +634,9 @@ class PlannerEngine:
             if not review.get("agrees", True):
                 if review.get("suggested_cli") and step["cli"] == "claude":
                     step["cli"] = review["suggested_cli"]
-                    step["agent"] = _route_agent(step["cli"])
+                    agent = agent_for_cli(step["cli"])
+                    step["agent"] = agent["id"]
+                    step["agent_role"] = agent["role"]
                 if review.get("suggested_backend"):
                     step["backend"] = review["suggested_backend"]
 
@@ -403,5 +685,55 @@ class PlannerEngine:
                 }
             except Exception:
                 pass
+
+        return result
+
+    def chat(
+        self,
+        message: str,
+        mission: dict[str, Any] | None,
+        workspace: str,
+        selected_machine: str | None,
+        selected_role: str | None,
+        chat_history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        result = _heuristic_chat(message, mission, workspace, selected_machine, selected_role)
+
+        if self._mlx_python:
+            system = (
+                "You are Constant, the main cockpit operator for a multi-machine coding fleet. "
+                "Return strict JSON with keys: intent, reply. "
+                "Valid intents: mission_create, cockpit_focus, cockpit_capture, cockpit_restart, cockpit_open, "
+                "buddy_answer, memory_lookup, plain_chat."
+            )
+            user = json.dumps(
+                {
+                    "message": message,
+                    "workspace": workspace,
+                    "mission": mission,
+                    "selected_machine": selected_machine,
+                    "selected_role": selected_role,
+                    "chat_history": _budget_chat_history(chat_history),
+                    "memory_hits": result.get("memory_hits", [])[:4],
+                    "buddy_note": result.get("buddy_note"),
+                    "skills": list_skills(),
+                    "skill_catalog": skill_catalog_brief(include_internal=True),
+                    "recommended_skill_stack": recommended_skill_stack(),
+                    "agents": list_agents(),
+                },
+                indent=2,
+            )
+            try:
+                model_result = self._call_model_json("planner", system, user)
+                result["intent"] = str(model_result.get("intent", result["intent"]))
+                result["reply"] = str(model_result.get("reply", result["reply"]))
+                result["mode"] = "mlx"
+            except Exception:
+                pass
+
+        if result["intent"] in {"plain_chat", "memory_lookup"} and result.get("buddy_note") is None:
+            prompt_l = _lower(message)
+            if any(token in prompt_l for token in ("route", "reroute", "machine", "cli", "pane", "codex", "claude", "vibe", "copilot")):
+                result["buddy_note"] = self.buddy_ask(mission, message)
 
         return result

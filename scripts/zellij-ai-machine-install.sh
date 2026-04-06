@@ -196,6 +196,18 @@ ensure_uv_tool() {
     ensure_command "$binary_name" || fail "Failed to install ${package_name} with uv."
 }
 
+ensure_constant_wrappers() {
+    local bin_dir="$HOME/.local/bin"
+    mkdir -p "$bin_dir"
+
+    ln -snf "$repo_dir/scripts/Constant" "$bin_dir/Constant"
+    ln -snf "$repo_dir/scripts/Constant" "$bin_dir/constant"
+    ln -snf "$repo_dir/scripts/constant-fleet.sh" "$bin_dir/constant-fleet"
+    ln -snf "$repo_dir/scripts/constant-machine.sh" "$bin_dir/constant-machine"
+    ln -snf "$repo_dir/scripts/constant-fleet-install.sh" "$bin_dir/constant-fleet-install"
+    ln -snf "$repo_dir/scripts/constant-machine-install.sh" "$bin_dir/constant-machine-install"
+}
+
 os_name="$(uname -s)"
 linux_id=""
 repo_dir="$(zellij_ai_expand_home_path "$(zellij_ai_default_repo_dir)")"
@@ -273,7 +285,7 @@ run_check() {
     print_status repo_dir "$repo_dir"
     print_status codex_home "$codex_home"
 
-    for binary in bash git tmux node npm uv claude codex copilot vibe; do
+    for binary in bash git tmux node npm uv claude codex copilot vibe constant; do
         if command -v "$binary" >/dev/null 2>&1; then
             print_status "$binary" "$(command -v "$binary")"
         else
@@ -394,6 +406,8 @@ run_install() {
     ensure_npm_global "@openai/codex" codex
     ensure_npm_global "@github/copilot" copilot
     ensure_uv_tool "mistral-vibe" vibe
+    ensure_constant_wrappers
+    refresh_path
 
     run_check
 }

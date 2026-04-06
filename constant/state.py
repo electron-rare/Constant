@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import uuid
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -10,6 +11,7 @@ from typing import Any
 from . import __version__
 from .paths import (
     cache_root,
+    chat_root,
     config_root,
     data_root,
     fleet_config_path,
@@ -67,6 +69,7 @@ DEFAULT_FLEET: dict[str, Any] = {
 
 DEFAULT_MODELS: dict[str, Any] = {
     "version": 1,
+    "enable_mlx": "auto",
     "planner": {
         "role": "planner",
         "model_id": "mlx-community-staging/Llama-3.2-3B-Instruct-mlx-4Bit",
@@ -109,7 +112,7 @@ def now_utc() -> str:
 
 
 def ensure_runtime_dirs() -> None:
-    for path in (cache_root(), config_root(), data_root(), missions_dir(), indexes_dir(), memory_sources_dir()):
+    for path in (cache_root(), chat_root(), config_root(), data_root(), missions_dir(), indexes_dir(), memory_sources_dir()):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -150,7 +153,14 @@ def load_fleet_config() -> dict[str, Any]:
 
 
 def load_models_config() -> dict[str, Any]:
-    return _read_json_yaml(models_config_path(), DEFAULT_MODELS)
+    payload = _read_json_yaml(models_config_path(), DEFAULT_MODELS)
+    merged = deepcopy(DEFAULT_MODELS)
+    for key, value in payload.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key].update(value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def load_memory_config() -> dict[str, Any]:
@@ -183,6 +193,63 @@ def mission_events_file(mission_id: str) -> Path:
 
 def mission_artifacts_dir(mission_id: str) -> Path:
     return mission_dir(mission_id) / "artifacts"
+
+
+def _workspace_chat_slug(workspace: str) -> str:
+    normalized = str(Path(workspace).expanduser().resolve())
+    name = Path(normalized).name or "workspace"
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:10]
+    return f"{name}-{digest}"
+
+
+def chat_file(workspace: str, mission_id: str | None = None) -> Path:
+    ensure_runtime_dirs()
+    if mission_id:
+        return chat_root() / "missions" / f"{mission_id}.ndjson"
+    return chat_root() / "workspaces" / f"{_workspace_chat_slug(workspace)}.ndjson"
+
+
+def read_chat_history(workspace: str, mission_id: str | None = None, limit: int = 80) -> list[dict[str, Any]]:
+    path = chat_file(workspace, mission_id=mission_id)
+    if not path.exists():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for raw in path.read_text(encoding="utf-8").splitlines()[-limit:]:
+        try:
+            entries.append(json.loads(raw))
+        except json.JSONDecodeError:
+            continue
+    return entries
+
+
+def append_chat_message(
+    role: str,
+    content: str,
+    *,
+    workspace: str,
+    mission_id: str | None = None,
+    intent: str | None = None,
+    machine: str | None = None,
+    pane: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    path = chat_file(workspace, mission_id=mission_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": now_utc(),
+        "role": role,
+        "content": content,
+        "intent": intent or "plain_chat",
+        "workspace": str(Path(workspace).expanduser().resolve()),
+        "mission_id": mission_id,
+        "machine": machine,
+        "pane": pane,
+        "meta": meta or {},
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+    return entry
 
 
 def create_mission(goal: str, workspace: str, routing_overrides: dict[str, Any] | None = None) -> dict[str, Any]:

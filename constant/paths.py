@@ -31,6 +31,10 @@ def missions_dir() -> Path:
     return cache_root() / "missions"
 
 
+def chat_root() -> Path:
+    return cache_root() / "chat"
+
+
 def fleet_config_path() -> Path:
     return config_root() / "fleet.json"
 
