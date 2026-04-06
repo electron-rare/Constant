@@ -17,14 +17,14 @@ Contributions should keep that bias visible in the code and in the product shape
 - make the cockpit more reliable
 - improve mission routing or verification
 - improve durable memory and repo context
-- sharpen the TUI and the `hexapus` buddy rail
+- sharpen the native Rust TUI and operator ergonomics
 - simplify setup without hiding the system
 - improve docs with concrete operator value
 
 ## Ground Rules
 
 - keep the CLI useful in non-interactive environments
-- prefer robust shell and Python over magic abstractions
+- prefer robust shell and Rust over magic abstractions
 - preserve local observability
 - do not hardcode personal machine names, users, IPs, or paths
 - treat clipboard, SSH, and session behavior as product features, not side details
@@ -44,9 +44,16 @@ Run at least the checks relevant to your change.
 Examples:
 
 ```bash
-python3 -m py_compile constant/*.py
+cargo test --no-run
 bash -n scripts/*.sh
-./scripts/Constant doctor
+./scripts/Constant --help
+```
+
+For doc-only changes, also sanity-check that the public surface still matches the code:
+
+```bash
+rg -n "fleet discover|fleet configure|fleet deploy|CONSTANT_USE_PYTHON|python3" README.md CONTRIBUTING.md scripts src tests
+bash -n scripts/*.sh
 ```
 
 If your change affects routing, fleet behavior, or memory shape, include a short explanation of:

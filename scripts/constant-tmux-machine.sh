@@ -72,6 +72,12 @@ pane_command() {
 set_pane_meta() {
     local pane_id="$1"
     local role="$2"
+    local command_string="${3:-}"
+    local reset_state="${4:-0}"
+    if [[ -n "$command_string" ]]; then
+        constant_tmux_set_managed_pane "$pane_id" "$role" "$command_string" "$reset_state"
+        return
+    fi
     tmux select-pane -t "$pane_id" -T "$role" >/dev/null 2>&1 || true
     tmux set-option -p -t "$pane_id" @constant_role "$role" >/dev/null 2>&1 || true
 }
@@ -87,10 +93,9 @@ create_session() {
     vibe_cmd="$(pane_command vibe)"
 
     tmux new-session -d -s "$session" -n "$machine_name" "$claude_cmd"
-    tmux set-option -t "$session" -g set-clipboard on >/dev/null 2>&1 || true
-    tmux set-option -t "$session" -g remain-on-exit on >/dev/null 2>&1 || true
-    tmux set-option -t "$session" -g mouse on >/dev/null 2>&1 || true
-    tmux set-option -t "$session" -g status-position top >/dev/null 2>&1 || true
+    constant_tmux_configure_autorestart_hook "$session"
+    constant_tmux_configure_status_chrome "$session" "$machine_name" "colour81"
+    constant_tmux_configure_chat_dock "$session" "$repo_dir" "$workspace" "$machine_name" "$machine_name"
     tmux set-window-option -t "$target_window" -g pane-base-index 0 >/dev/null 2>&1 || true
 
     claude_pane="$(tmux list-panes -t "$target_window" -F '#{pane_id}' | head -n 1)"
@@ -100,14 +105,15 @@ create_session() {
 
     tmux select-layout -t "$target_window" main-vertical >/dev/null
     tmux resize-pane -t "$claude_pane" -x 120 >/dev/null 2>&1 || true
-    set_pane_meta "$claude_pane" claude
-    set_pane_meta "$codex_pane" codex
-    set_pane_meta "$copilot_pane" copilot
-    set_pane_meta "$vibe_pane" vibe
+    set_pane_meta "$claude_pane" claude "$claude_cmd" 1
+    set_pane_meta "$codex_pane" codex "$codex_cmd" 1
+    set_pane_meta "$copilot_pane" copilot "$copilot_cmd" 1
+    set_pane_meta "$vibe_pane" vibe "$vibe_cmd" 1
     tmux select-pane -t "$claude_pane" >/dev/null
 }
 
 ensure_session() {
+    local role pane_id command_string
     mkdir -p "$state_dir" "$bus_dir/messages"
 
     if $recreate && constant_tmux_session_exists "$session"; then
@@ -119,11 +125,25 @@ ensure_session() {
         return 0
     fi
 
+    constant_tmux_configure_autorestart_hook "$session"
+    constant_tmux_configure_status_chrome "$session" "$machine_name" "colour81"
+    constant_tmux_configure_chat_dock "$session" "$repo_dir" "$workspace" "$machine_name" "$machine_name"
+
     if ! constant_tmux_window_exists "$session" "$machine_name"; then
         recreate=true
         tmux kill-session -t "$session" >/dev/null 2>&1 || true
         create_session
+        return 0
     fi
+
+    for role in claude codex copilot vibe; do
+        pane_id="$(role_pane_id "$role")"
+        if [[ -z "$pane_id" ]]; then
+            continue
+        fi
+        command_string="$(pane_command "$role")"
+        set_pane_meta "$pane_id" "$role" "$command_string"
+    done
 }
 
 focus_role() {
@@ -154,7 +174,7 @@ restart_role() {
 
     command_string="$(pane_command "$role")"
     tmux respawn-pane -k -t "$pane_id" "$command_string"
-    set_pane_meta "$pane_id" "$role"
+    set_pane_meta "$pane_id" "$role" "$command_string" 1
     tmux select-layout -t "$(tmux_target_window)" main-vertical >/dev/null
 }
 
@@ -190,7 +210,7 @@ send_role() {
 
 session="$(zellij_ai_default_session)"
 workspace="$PWD"
-repo_dir="$(zellij_ai_expand_home_path "$(zellij_ai_default_repo_dir)")"
+repo_dir="$(cd "$script_dir/.." && pwd -P)"
 codex_home="$(zellij_ai_expand_home_path "$(zellij_ai_default_codex_home)")"
 claude_config_dir=""
 machine_name="${ZELLIJ_AI_MACHINE_NAME:-$(zellij_ai_local_machine_label)}"

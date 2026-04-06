@@ -1,17 +1,18 @@
 mod buddy;
 mod capabilities;
+mod chat;
 mod cockpit;
 mod config;
 mod executor;
 mod fleet;
 mod memory;
 mod mission;
+mod operator;
 mod paths;
 mod state;
 mod tui;
 
 use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -23,15 +24,22 @@ use serde_json::{Value, json};
 
 use buddy::buddy_ask;
 use capabilities::{AGENTS, MINIMAL_STACK, SKILLS, VERSION, WORKFLOW_STACK};
+use chat::delete_mission_thread;
 use cockpit::{
-    capture_pane, cockpit_attach, cockpit_doctor, cockpit_open, focus_machine, restart_pane,
-    runtime_status, send_to_pane,
+    capture_pane, cockpit_attach, cockpit_doctor, cockpit_open, cockpit_status_line,
+    focus_machine, restart_pane, runtime_status, send_to_pane,
 };
 use config::{fleet_machine, load_fleet_config, load_memory_config, load_models_config};
 use executor::{run_mission, summarize_mission_command, verify_mission};
-use fleet::{bridge_sync, fleet_check};
-use memory::summarize_mission_to_memory;
+use fleet::{
+    bridge_sync, fleet_check, fleet_config_query, render_scan_json, write_fleet_config,
+};
+use memory::{
+    enroll_workspace, list_decisions, memory_status, persona_markdown, rebuild_workspace_memory,
+    search_memory, summarize_mission_to_memory, sync_qdrant,
+};
 use mission::{delegate_step, plan_mission, retry_mission};
+use operator::{health_value, models_status_value};
 use state::{
     append_event, list_missions, load_mission, mission_events_text, mission_summary_value,
     new_mission, save_mission,
@@ -65,15 +73,16 @@ fn run() -> Result<ExitCode, String> {
         }
         "skills" => handle_skills(&args[1..]),
         "agents" => handle_agents(&args[1..]),
+        "models" => handle_models(&args[1..]),
         "doctor" => handle_doctor(&args[1..]),
         "tui" => handle_tui(&args[1..]),
         "cockpit" => handle_cockpit(&args[1..]),
         "mission" => handle_mission(&args[1..]),
         "delegate" => handle_delegate(&args[1..]),
         "buddy" => handle_buddy(&args[1..]),
-        "memory" => handoff_to_python(&args),
+        "memory" => handle_memory(&args[1..]),
         "fleet" => handle_fleet(&args[1..]),
-        _ => handoff_to_python(&args),
+        other => Err(format!("unknown command: {other}")),
     }
 }
 
@@ -104,21 +113,24 @@ Rust front-controller for Constant.
 
 Commands handled in Rust:
   doctor [--json]
+  models status [--json]
   agents [--json]
   skills [--json] [--public-only]
   tui [--workspace DIR] [--local-session NAME] [--session NAME]
-  cockpit open|attach|status|doctor|focus|send|capture|restart
+  cockpit open|attach|status|status-line|doctor|focus|send|capture|restart
   mission create <prompt> [--workspace DIR] [--json]
   mission plan <mission_id> [--json]
   mission run <mission_id> [--json]
+  mission delete <mission_id> [--json]
   mission status [mission_id] [--verbose] [--json]
   mission tail <mission_id> [--follow]
   mission verify <mission_id> [--step-id ID] [--json]
   mission retry <mission_id> [--step-id ID] [--json]
   mission summarize <mission_id> [--json]
   delegate <mission_id> [--step-id ID] [--machine LABEL] [--backend NAME] [--cli NAME] [--agent ID] [--skill ID] [--json]
+  buddy ask <prompt> [--mission-id ID] [--json]
+  memory status|rebuild|enroll|search|persona show|decisions|sync-qdrant
 
-Other commands still hand off to the existing Python runtime during migration.
 Running `{prog}` with no arguments opens or attaches the full fleet cockpit.
 Use `{prog} tui --workspace DIR` for the standalone TUI."
     );
@@ -135,11 +147,21 @@ fn handle_skills(args: &[String]) -> Result<ExitCode, String> {
         match arg.as_str() {
             "--json" => as_json = true,
             "--public-only" => public_only = true,
-            _ => return handoff_to_python_with_prefix("skills", args),
+            other => return Err(format!("unknown skills option: {other}")),
         }
     }
     print_skills(as_json, public_only)?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn handle_models(args: &[String]) -> Result<ExitCode, String> {
+    if args.is_empty() {
+        return Err("models requires a subcommand".to_string());
+    }
+    match args[0].as_str() {
+        "status" => models_status_cmd(&args[1..]),
+        other => Err(format!("unknown models subcommand: {other}")),
+    }
 }
 
 fn handle_agents(args: &[String]) -> Result<ExitCode, String> {
@@ -147,7 +169,7 @@ fn handle_agents(args: &[String]) -> Result<ExitCode, String> {
     for arg in args {
         match arg.as_str() {
             "--json" => as_json = true,
-            _ => return handoff_to_python_with_prefix("agents", args),
+            other => return Err(format!("unknown agents option: {other}")),
         }
     }
     print_agents(as_json)?;
@@ -159,10 +181,22 @@ fn handle_doctor(args: &[String]) -> Result<ExitCode, String> {
     for arg in args {
         match arg.as_str() {
             "--json" => as_json = true,
-            _ => return handoff_to_python_with_prefix("doctor", args),
+            other => return Err(format!("unknown doctor option: {other}")),
         }
     }
     print_doctor(as_json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn models_status_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let mut as_json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => as_json = true,
+            other => return Err(format!("unknown models status option: {other}")),
+        }
+    }
+    print_value(&models_status_value()?, as_json)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -198,17 +232,13 @@ fn handle_tui(args: &[String]) -> Result<ExitCode, String> {
                     .cloned()
                     .ok_or_else(|| "--session requires a value".to_string())?;
             }
-            _ => return handoff_to_python_with_prefix("tui", args),
+            other => return Err(format!("unknown tui option: {other}")),
         }
         index += 1;
     }
 
     let workspace = canonical_workspace(&workspace)?;
-    match run_tui(
-        workspace.clone(),
-        local_session.clone(),
-        machine_session.clone(),
-    )? {
+    match run_tui(workspace.clone(), local_session.clone(), machine_session.clone())? {
         TuiAction::Exit => Ok(ExitCode::SUCCESS),
         TuiAction::OpenCockpit => Ok(exit_code_from_status(Some(cockpit_open(
             &workspace,
@@ -228,16 +258,13 @@ fn handle_cockpit(args: &[String]) -> Result<ExitCode, String> {
         "open" => cockpit_open_cmd(&args[1..]),
         "attach" => cockpit_attach_cmd(&args[1..]),
         "status" => cockpit_status_cmd(&args[1..]),
+        "status-line" => cockpit_status_line_cmd(&args[1..]),
         "doctor" => cockpit_doctor_cmd(&args[1..]),
         "focus" => cockpit_focus_cmd(&args[1..]),
         "send" => cockpit_send_cmd(&args[1..]),
         "capture" => cockpit_capture_cmd(&args[1..]),
         "restart" => cockpit_restart_cmd(&args[1..]),
-        _ => {
-            let mut forwarded = vec!["cockpit".to_string()];
-            forwarded.extend(args.iter().cloned());
-            handoff_to_python(&forwarded)
-        }
+        other => Err(format!("unknown cockpit subcommand: {other}")),
     }
 }
 
@@ -250,16 +277,13 @@ fn handle_mission(args: &[String]) -> Result<ExitCode, String> {
         "create" => mission_create(&args[1..]),
         "plan" => mission_plan(&args[1..]),
         "run" => mission_run_cmd(&args[1..]),
+        "delete" => mission_delete_cmd(&args[1..]),
         "status" => mission_status(&args[1..]),
         "tail" => mission_tail(&args[1..]),
         "verify" => mission_verify_cmd(&args[1..]),
         "retry" => mission_retry_cmd(&args[1..]),
         "summarize" => mission_summarize_cmd(&args[1..]),
-        _ => {
-            let mut forwarded = vec!["mission".to_string()];
-            forwarded.extend(args.iter().cloned());
-            handoff_to_python(&forwarded)
-        }
+        other => Err(format!("unknown mission subcommand: {other}")),
     }
 }
 
@@ -269,11 +293,23 @@ fn handle_buddy(args: &[String]) -> Result<ExitCode, String> {
     }
     match args[0].as_str() {
         "ask" => buddy_ask_cmd(&args[1..]),
-        _ => {
-            let mut forwarded = vec!["buddy".to_string()];
-            forwarded.extend(args.iter().cloned());
-            handoff_to_python(&forwarded)
-        }
+        other => Err(format!("unknown buddy subcommand: {other}")),
+    }
+}
+
+fn handle_memory(args: &[String]) -> Result<ExitCode, String> {
+    if args.is_empty() {
+        return Err("memory requires a subcommand".to_string());
+    }
+    match args[0].as_str() {
+        "status" => memory_status_cmd(&args[1..]),
+        "rebuild" => memory_rebuild_cmd(&args[1..]),
+        "enroll" => memory_enroll_cmd(&args[1..]),
+        "search" => memory_search_cmd(&args[1..]),
+        "persona" => memory_persona_cmd(&args[1..]),
+        "decisions" => memory_decisions_cmd(&args[1..]),
+        "sync-qdrant" => memory_sync_qdrant_cmd(&args[1..]),
+        other => Err(format!("unknown memory subcommand: {other}")),
     }
 }
 
@@ -284,11 +320,10 @@ fn handle_fleet(args: &[String]) -> Result<ExitCode, String> {
     match args[0].as_str() {
         "status" => fleet_status_cmd(&args[1..]),
         "sync" => fleet_sync_cmd(&args[1..]),
-        _ => {
-            let mut forwarded = vec!["fleet".to_string()];
-            forwarded.extend(args.iter().cloned());
-            handoff_to_python(&forwarded)
-        }
+        "config-get" => fleet_config_get_cmd(&args[1..]),
+        "render-scan-json" => fleet_render_scan_json_cmd(&args[1..]),
+        "write-config" => fleet_write_config_cmd(&args[1..]),
+        other => Err(format!("unknown fleet subcommand: {other}")),
     }
 }
 
@@ -311,12 +346,10 @@ fn mission_create(args: &[String]) -> Result<ExitCode, String> {
                     .ok_or_else(|| "--workspace requires a value".to_string())?;
             }
             "--json" => as_json = true,
-            value if value.starts_with("--") => {
-                return handoff_mission_subcommand("create", args);
-            }
+            value if value.starts_with("--") => return Err(format!("unknown mission create option: {value}")),
             value => {
                 if prompt.is_some() {
-                    return handoff_mission_subcommand("create", args);
+                    return Err("mission create accepts a single prompt".to_string());
                 }
                 prompt = Some(value.to_string());
             }
@@ -360,10 +393,10 @@ fn mission_plan(args: &[String]) -> Result<ExitCode, String> {
     for arg in args {
         match arg.as_str() {
             "--json" => as_json = true,
-            value if value.starts_with("--") => return handoff_mission_subcommand("plan", args),
+            value if value.starts_with("--") => return Err(format!("unknown mission plan option: {value}")),
             value => {
                 if mission_id.is_some() {
-                    return handoff_mission_subcommand("plan", args);
+                    return Err("mission plan accepts a single mission_id".to_string());
                 }
                 mission_id = Some(value.to_string());
             }
@@ -402,10 +435,10 @@ fn mission_run_cmd(args: &[String]) -> Result<ExitCode, String> {
     for arg in args {
         match arg.as_str() {
             "--json" => as_json = true,
-            value if value.starts_with("--") => return handoff_mission_subcommand("run", args),
+            value if value.starts_with("--") => return Err(format!("unknown mission run option: {value}")),
             value => {
                 if mission_id.is_some() {
-                    return handoff_mission_subcommand("run", args);
+                    return Err("mission run accepts a single mission_id".to_string());
                 }
                 mission_id = Some(value.to_string());
             }
@@ -427,10 +460,10 @@ fn mission_status(args: &[String]) -> Result<ExitCode, String> {
         match arg.as_str() {
             "--verbose" => verbose = true,
             "--json" => as_json = true,
-            value if value.starts_with("--") => return handoff_mission_subcommand("status", args),
+            value if value.starts_with("--") => return Err(format!("unknown mission status option: {value}")),
             value => {
                 if mission_id.is_some() {
-                    return handoff_mission_subcommand("status", args);
+                    return Err("mission status accepts at most one mission_id".to_string());
                 }
                 mission_id = Some(value.to_string());
             }
@@ -464,10 +497,10 @@ fn mission_tail(args: &[String]) -> Result<ExitCode, String> {
     for arg in args {
         match arg.as_str() {
             "--follow" => follow = true,
-            value if value.starts_with("--") => return handoff_mission_subcommand("tail", args),
+            value if value.starts_with("--") => return Err(format!("unknown mission tail option: {value}")),
             value => {
                 if mission_id.is_some() {
-                    return handoff_mission_subcommand("tail", args);
+                    return Err("mission tail accepts a single mission_id".to_string());
                 }
                 mission_id = Some(value.to_string());
             }
@@ -513,10 +546,10 @@ fn mission_verify_cmd(args: &[String]) -> Result<ExitCode, String> {
                 );
             }
             "--json" => as_json = true,
-            value if value.starts_with("--") => return handoff_mission_subcommand("verify", args),
+            value if value.starts_with("--") => return Err(format!("unknown mission verify option: {value}")),
             value => {
                 if mission_id.is_some() {
-                    return handoff_mission_subcommand("verify", args);
+                    return Err("mission verify accepts a single mission_id".to_string());
                 }
                 mission_id = Some(value.to_string());
             }
@@ -549,10 +582,10 @@ fn mission_retry_cmd(args: &[String]) -> Result<ExitCode, String> {
                 );
             }
             "--json" => as_json = true,
-            value if value.starts_with("--") => return handoff_mission_subcommand("retry", args),
+            value if value.starts_with("--") => return Err(format!("unknown mission retry option: {value}")),
             value => {
                 if mission_id.is_some() {
-                    return handoff_mission_subcommand("retry", args);
+                    return Err("mission retry accepts a single mission_id".to_string());
                 }
                 mission_id = Some(value.to_string());
             }
@@ -575,12 +608,10 @@ fn mission_summarize_cmd(args: &[String]) -> Result<ExitCode, String> {
     for arg in args {
         match arg.as_str() {
             "--json" => as_json = true,
-            value if value.starts_with("--") => {
-                return handoff_mission_subcommand("summarize", args);
-            }
+            value if value.starts_with("--") => return Err(format!("unknown mission summarize option: {value}")),
             value => {
                 if mission_id.is_some() {
-                    return handoff_mission_subcommand("summarize", args);
+                    return Err("mission summarize accepts a single mission_id".to_string());
                 }
                 mission_id = Some(value.to_string());
             }
@@ -595,6 +626,27 @@ fn mission_summarize_cmd(args: &[String]) -> Result<ExitCode, String> {
         &json!({ "artifact_summary": payload, "memory_summary": memory }),
         as_json,
     )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn mission_delete_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let mut mission_id: Option<String> = None;
+    let mut as_json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => as_json = true,
+            value if value.starts_with("--") => return Err(format!("unknown mission delete option: {value}")),
+            value => {
+                if mission_id.is_some() {
+                    return Err("mission delete accepts a single mission_id".to_string());
+                }
+                mission_id = Some(value.to_string());
+            }
+        }
+    }
+    let mission_id = mission_id.ok_or_else(|| "mission delete requires a mission_id".to_string())?;
+    delete_mission_thread(&mission_id)?;
+    print_value(&json!({ "deleted": true, "mission_id": mission_id }), as_json)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -663,10 +715,8 @@ fn handle_delegate(args: &[String]) -> Result<ExitCode, String> {
                 );
             }
             "--json" => as_json = true,
-            value if value.starts_with("--") => {
-                return handoff_to_python_with_prefix("delegate", args);
-            }
-            _ => return handoff_to_python_with_prefix("delegate", args),
+            value if value.starts_with("--") => return Err(format!("unknown delegate option: {value}")),
+            value => return Err(format!("unexpected delegate argument: {value}")),
         }
         index += 1;
     }
@@ -707,16 +757,10 @@ fn buddy_ask_cmd(args: &[String]) -> Result<ExitCode, String> {
                 );
             }
             "--json" => as_json = true,
-            value if value.starts_with("--") => {
-                let mut forwarded = vec!["buddy".to_string(), "ask".to_string()];
-                forwarded.extend(args.iter().cloned());
-                return handoff_to_python(&forwarded);
-            }
+            value if value.starts_with("--") => return Err(format!("unknown buddy ask option: {value}")),
             value => {
                 if prompt.is_some() {
-                    let mut forwarded = vec!["buddy".to_string(), "ask".to_string()];
-                    forwarded.extend(args.iter().cloned());
-                    return handoff_to_python(&forwarded);
+                    return Err("buddy ask accepts a single prompt".to_string());
                 }
                 prompt = Some(value.to_string());
             }
@@ -729,6 +773,197 @@ fn buddy_ask_cmd(args: &[String]) -> Result<ExitCode, String> {
     let payload = buddy_ask(mission.as_ref(), &prompt, workspace)?;
     print_value(&payload, as_json)?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn memory_status_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let mut workspace: Option<String> = None;
+    let mut as_json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace" => {
+                index += 1;
+                workspace = Some(
+                    args.get(index)
+                        .cloned()
+                        .ok_or_else(|| "--workspace requires a value".to_string())?,
+                );
+            }
+            "--json" => as_json = true,
+            other => return Err(format!("unknown memory status option: {other}")),
+        }
+        index += 1;
+    }
+    print_value(&memory_status(workspace.as_deref())?, as_json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn memory_rebuild_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let mut workspace = env::current_dir()
+        .map_err(|err| format!("cannot resolve current directory: {err}"))?
+        .to_string_lossy()
+        .into_owned();
+    let mut enroll = true;
+    let mut as_json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace" => {
+                index += 1;
+                workspace = args
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| "--workspace requires a value".to_string())?;
+            }
+            "--no-enroll" => enroll = false,
+            "--json" => as_json = true,
+            other => return Err(format!("unknown memory rebuild option: {other}")),
+        }
+        index += 1;
+    }
+    print_value(&rebuild_workspace_memory(&workspace, enroll)?, as_json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn memory_enroll_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let mut path: Option<String> = None;
+    let mut as_json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => as_json = true,
+            value if value.starts_with("--") => return Err(format!("unknown memory enroll option: {value}")),
+            value => {
+                if path.is_some() {
+                    return Err("memory enroll accepts a single path".to_string());
+                }
+                path = Some(value.to_string());
+            }
+        }
+    }
+    let path = path.ok_or_else(|| "memory enroll requires a path".to_string())?;
+    print_value(&enroll_workspace(&path)?, as_json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn memory_search_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let mut query: Option<String> = None;
+    let mut workspace: Option<String> = None;
+    let mut limit: Option<usize> = None;
+    let mut as_json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace" => {
+                index += 1;
+                workspace = Some(
+                    args.get(index)
+                        .cloned()
+                        .ok_or_else(|| "--workspace requires a value".to_string())?,
+                );
+            }
+            "--limit" => {
+                index += 1;
+                limit = Some(
+                    args.get(index)
+                        .ok_or_else(|| "--limit requires a value".to_string())?
+                        .parse::<usize>()
+                        .map_err(|_| "--limit must be an integer".to_string())?,
+                );
+            }
+            "--json" => as_json = true,
+            value if value.starts_with("--") => return Err(format!("unknown memory search option: {value}")),
+            value => {
+                if query.is_some() {
+                    return Err("memory search accepts a single query".to_string());
+                }
+                query = Some(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let query = query.ok_or_else(|| "memory search requires a query".to_string())?;
+    print_value(&search_memory(&query, workspace.as_deref(), limit)?, as_json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn memory_persona_cmd(args: &[String]) -> Result<ExitCode, String> {
+    if args.is_empty() {
+        return Err("memory persona requires a subcommand".to_string());
+    }
+    match args[0].as_str() {
+        "show" => {
+            let as_json = args.iter().skip(1).any(|arg| arg == "--json");
+            if args.iter().skip(1).any(|arg| arg != "--json") {
+                return Err("unknown memory persona show option".to_string());
+            }
+            let persona = persona_markdown()?;
+            if as_json {
+                print_value(&json!({ "persona": persona }), true)?;
+            } else {
+                println!("{persona}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        other => Err(format!("unknown memory persona subcommand: {other}")),
+    }
+}
+
+fn memory_decisions_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let mut workspace: Option<String> = None;
+    let mut mission_id: Option<String> = None;
+    let mut as_json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace" => {
+                index += 1;
+                workspace = Some(
+                    args.get(index)
+                        .cloned()
+                        .ok_or_else(|| "--workspace requires a value".to_string())?,
+                );
+            }
+            "--mission-id" => {
+                index += 1;
+                mission_id = Some(
+                    args.get(index)
+                        .cloned()
+                        .ok_or_else(|| "--mission-id requires a value".to_string())?,
+                );
+            }
+            "--json" => as_json = true,
+            other => return Err(format!("unknown memory decisions option: {other}")),
+        }
+        index += 1;
+    }
+    print_value(&list_decisions(workspace.as_deref(), mission_id.as_deref())?, as_json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn memory_sync_qdrant_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let mut workspace: Option<String> = None;
+    let mut as_json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace" => {
+                index += 1;
+                workspace = Some(
+                    args.get(index)
+                        .cloned()
+                        .ok_or_else(|| "--workspace requires a value".to_string())?,
+                );
+            }
+            "--json" => as_json = true,
+            other => return Err(format!("unknown memory sync-qdrant option: {other}")),
+        }
+        index += 1;
+    }
+    let payload = sync_qdrant(workspace.as_deref())?;
+    let ok = payload.get("ok").and_then(Value::as_bool).unwrap_or(false)
+        || payload.get("skipped").and_then(Value::as_bool).unwrap_or(false);
+    print_value(&payload, as_json)?;
+    Ok(exit_code_from_status(Some(if ok { 0 } else { 1 })))
 }
 
 fn fleet_status_cmd(args: &[String]) -> Result<ExitCode, String> {
@@ -755,16 +990,63 @@ fn fleet_sync_cmd(args: &[String]) -> Result<ExitCode, String> {
     Ok(exit_code_from_status(Some(if ok { 0 } else { 1 })))
 }
 
-fn handoff_mission_subcommand(prefix: &str, tail: &[String]) -> Result<ExitCode, String> {
-    let mut args = vec!["mission".to_string(), prefix.to_string()];
-    args.extend(tail.iter().cloned());
-    handoff_to_python(&args)
+fn fleet_config_get_cmd(args: &[String]) -> Result<ExitCode, String> {
+    if args.len() != 1 {
+        return Err("fleet config-get requires exactly one query name".to_string());
+    }
+    if let Some(lines) = fleet_config_query(&args[0])? {
+        for line in lines {
+            println!("{line}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
-fn handoff_cockpit_subcommand(prefix: &str, tail: &[String]) -> Result<ExitCode, String> {
-    let mut args = vec!["cockpit".to_string(), prefix.to_string()];
-    args.extend(tail.iter().cloned());
-    handoff_to_python(&args)
+fn fleet_render_scan_json_cmd(args: &[String]) -> Result<ExitCode, String> {
+    if args.len() != 1 {
+        return Err("fleet render-scan-json requires a candidates file".to_string());
+    }
+    let path = Path::new(&args[0]);
+    print_value(&render_scan_json(path)?, true)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn fleet_write_config_cmd(args: &[String]) -> Result<ExitCode, String> {
+    if args.is_empty() {
+        return Err("fleet write-config requires a finalized selection file".to_string());
+    }
+    let finalized_file = Path::new(&args[0]);
+    let mut output_path: Option<PathBuf> = None;
+    let mut repo_dir: Option<String> = None;
+
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--output" => {
+                index += 1;
+                output_path = Some(PathBuf::from(
+                    args.get(index)
+                        .ok_or_else(|| "--output requires a value".to_string())?,
+                ));
+            }
+            "--repo-dir" => {
+                index += 1;
+                repo_dir = Some(
+                    args.get(index)
+                        .cloned()
+                        .ok_or_else(|| "--repo-dir requires a value".to_string())?,
+                );
+            }
+            other => return Err(format!("unknown fleet write-config option: {other}")),
+        }
+        index += 1;
+    }
+
+    let output_path = output_path.ok_or_else(|| "--output is required".to_string())?;
+    let repo_dir = repo_dir.ok_or_else(|| "--repo-dir is required".to_string())?;
+    let written = write_fleet_config(finalized_file, &output_path, &repo_dir)?;
+    println!("{}", written.display());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cockpit_open_cmd(args: &[String]) -> Result<ExitCode, String> {
@@ -802,7 +1084,7 @@ fn cockpit_open_cmd(args: &[String]) -> Result<ExitCode, String> {
             }
             "--recreate" => recreate = true,
             "--remote-recreate" => remote_recreate = true,
-            _ => return handoff_cockpit_subcommand("open", args),
+            other => return Err(format!("unknown cockpit open option: {other}")),
         }
         index += 1;
     }
@@ -828,7 +1110,7 @@ fn cockpit_attach_cmd(args: &[String]) -> Result<ExitCode, String> {
                     .cloned()
                     .ok_or_else(|| "--local-session requires a value".to_string())?;
             }
-            _ => return handoff_cockpit_subcommand("attach", args),
+            other => return Err(format!("unknown cockpit attach option: {other}")),
         }
         index += 1;
     }
@@ -858,7 +1140,7 @@ fn cockpit_status_cmd(args: &[String]) -> Result<ExitCode, String> {
                     .ok_or_else(|| "--session requires a value".to_string())?;
             }
             "--json" => as_json = true,
-            _ => return handoff_cockpit_subcommand("status", args),
+            other => return Err(format!("unknown cockpit status option: {other}")),
         }
         index += 1;
     }
@@ -889,7 +1171,7 @@ fn cockpit_doctor_cmd(args: &[String]) -> Result<ExitCode, String> {
                     .ok_or_else(|| "--session requires a value".to_string())?;
             }
             "--json" => as_json = true,
-            _ => return handoff_cockpit_subcommand("doctor", args),
+            other => return Err(format!("unknown cockpit doctor option: {other}")),
         }
         index += 1;
     }
@@ -938,7 +1220,7 @@ fn cockpit_focus_cmd(args: &[String]) -> Result<ExitCode, String> {
                     .ok_or_else(|| "--session requires a value".to_string())?;
             }
             "--json" => as_json = true,
-            _ => return handoff_cockpit_subcommand("focus", args),
+            other => return Err(format!("unknown cockpit focus option: {other}")),
         }
         index += 1;
     }
@@ -989,7 +1271,7 @@ fn cockpit_send_cmd(args: &[String]) -> Result<ExitCode, String> {
                     .ok_or_else(|| "--session requires a value".to_string())?;
             }
             "--json" => as_json = true,
-            _ => return handoff_cockpit_subcommand("send", args),
+            other => return Err(format!("unknown cockpit send option: {other}")),
         }
         index += 1;
     }
@@ -1044,7 +1326,7 @@ fn cockpit_capture_cmd(args: &[String]) -> Result<ExitCode, String> {
                     .ok_or_else(|| "--session requires a value".to_string())?;
             }
             "--json" => as_json = true,
-            _ => return handoff_cockpit_subcommand("capture", args),
+            other => return Err(format!("unknown cockpit capture option: {other}")),
         }
         index += 1;
     }
@@ -1094,7 +1376,7 @@ fn cockpit_restart_cmd(args: &[String]) -> Result<ExitCode, String> {
                     .ok_or_else(|| "--session requires a value".to_string())?;
             }
             "--json" => as_json = true,
-            _ => return handoff_cockpit_subcommand("restart", args),
+            other => return Err(format!("unknown cockpit restart option: {other}")),
         }
         index += 1;
     }
@@ -1107,41 +1389,80 @@ fn cockpit_restart_cmd(args: &[String]) -> Result<ExitCode, String> {
     Ok(exit_code_from_status(Some(payload.returncode)))
 }
 
-fn handoff_to_python_with_prefix(prefix: &str, tail: &[String]) -> Result<ExitCode, String> {
-    let mut args = vec![prefix.to_string()];
-    args.extend(tail.iter().cloned());
-    handoff_to_python(&args)
-}
-
-fn handoff_to_python(args: &[String]) -> Result<ExitCode, String> {
-    let repo_root = paths::repo_root();
-    let default_python = paths::home_dir()
-        .map(|home| home.join(".local/share/constant/venv/bin/python3"))
-        .filter(|path| path.exists());
-    let python_bin = env::var_os("CONSTANT_PYTHON")
-        .or_else(|| default_python.map(Into::into))
-        .unwrap_or_else(|| OsString::from("python3"));
-
-    let mut command = Command::new(python_bin);
-    command.arg("-m").arg("constant");
-    command.args(args);
-    command.env("CONSTANT_PROG_NAME", program_name());
-    command.env("CONSTANT_RUST_HANDOFF", "1");
-    command.env("PYTHONPATH", python_path_with_repo(&repo_root));
-    let status = command
-        .status()
-        .map_err(|err| format!("python handoff failed: {err}"))?;
-
-    Ok(exit_code_from_status(status.code()))
-}
-
-fn python_path_with_repo(repo_root: &Path) -> OsString {
-    let mut value = OsString::from(repo_root.as_os_str());
-    if let Some(existing) = env::var_os("PYTHONPATH") {
-        value.push(":");
-        value.push(existing);
+fn cockpit_status_line_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let mut workspace = env::current_dir()
+        .map_err(|err| format!("cannot resolve current directory: {err}"))?
+        .to_string_lossy()
+        .into_owned();
+    let mut scope_label: Option<String> = None;
+    let mut machine_label: Option<String> = None;
+    let mut max_length = 180_usize;
+    let mut local_session = "constant-fleet".to_string();
+    let mut machine_session = "constant".to_string();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace" => {
+                index += 1;
+                workspace = args
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| "--workspace requires a value".to_string())?;
+            }
+            "--scope-label" => {
+                index += 1;
+                scope_label = Some(
+                    args.get(index)
+                        .cloned()
+                        .ok_or_else(|| "--scope-label requires a value".to_string())?,
+                );
+            }
+            "--machine-label" => {
+                index += 1;
+                machine_label = Some(
+                    args.get(index)
+                        .cloned()
+                        .ok_or_else(|| "--machine-label requires a value".to_string())?,
+                );
+            }
+            "--max-length" => {
+                index += 1;
+                max_length = args
+                    .get(index)
+                    .ok_or_else(|| "--max-length requires a value".to_string())?
+                    .parse::<usize>()
+                    .map_err(|_| "--max-length must be an integer".to_string())?;
+            }
+            "--local-session" => {
+                index += 1;
+                local_session = args
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| "--local-session requires a value".to_string())?;
+            }
+            "--session" => {
+                index += 1;
+                machine_session = args
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| "--session requires a value".to_string())?;
+            }
+            other => return Err(format!("unknown cockpit status-line option: {other}")),
+        }
+        index += 1;
     }
-    value
+    println!(
+        "{}",
+        cockpit_status_line(
+            &canonical_workspace(&workspace)?,
+            scope_label.as_deref(),
+            machine_label.as_deref(),
+            max_length,
+            &local_session,
+            &machine_session,
+        )?
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn canonical_workspace(input: &str) -> Result<String, String> {
@@ -1216,6 +1537,7 @@ fn doctor_value() -> Result<Value, String> {
     let fleet = load_fleet_config()?;
     let models = load_models_config()?;
     let memory = load_memory_config()?;
+    let health = health_value()?;
 
     Ok(json!({
         "version": VERSION,
@@ -1225,10 +1547,9 @@ fn doctor_value() -> Result<Value, String> {
         "data_root": paths::data_root().display().to_string(),
         "rust": {
             "front_controller": true,
-            "python_handoff": command_exists("python3"),
+            "python_handoff": false,
         },
         "commands": {
-            "python3": command_exists("python3"),
             "tmux": command_exists("tmux"),
             "cargo": command_exists("cargo"),
             "claude": command_exists("claude"),
@@ -1247,6 +1568,7 @@ fn doctor_value() -> Result<Value, String> {
             "machines": fleet.machines,
         },
         "models": models,
+        "health": health,
         "memory": memory,
         "wrapper": wrapper_status_value(),
     }))
@@ -1259,43 +1581,13 @@ fn wrapper_status_value() -> Value {
         "wrapper_dir": wrapper_dir.display().to_string(),
         "rust_bin": rust_bin.display().to_string(),
         "rust_bin_exists": rust_bin.exists(),
-        "forced_python": env::var("CONSTANT_USE_PYTHON").ok().as_deref() == Some("1"),
-        "forced_rust": env::var("CONSTANT_USE_RUST").ok().as_deref() == Some("1"),
-        "force_recheck": env::var("CONSTANT_RUST_RECHECK").ok().as_deref() == Some("1"),
+        "mode": "rust-only",
         "last_mode": read_wrapper_mode(&wrapper_dir.join("last-mode")),
-        "cache": {
-            "rust_ok": read_wrapper_stamp(&wrapper_dir.join("rust-ok")),
-            "rust_fail": read_wrapper_stamp(&wrapper_dir.join("rust-fail")),
-        },
         "codesign_verify": if rust_bin.exists() { Some(run_quick_command(&["codesign", "--verify", "--verbose=2", &rust_bin.display().to_string()])) } else { None },
         "spctl_assess": if rust_bin.exists() { Some(run_quick_command(&["spctl", "--assess", "-vv", &rust_bin.display().to_string()])) } else { None },
         "xattr_provenance": if rust_bin.exists() { Some(run_quick_command(&["xattr", "-p", "com.apple.provenance", &rust_bin.display().to_string()])) } else { None },
-        "hint": "If spctl rejects the Rust binary from a normal terminal, allow that terminal in System Settings -> Privacy & Security -> Developer Tools, then rerun with CONSTANT_RUST_RECHECK=1 to force a fresh startup probe.",
+        "hint": "The public wrapper is Rust-only. If the binary is missing or stale, rerun ./scripts/Constant and it will rebuild and ad-hoc sign the binary before launch.",
     })
-}
-
-fn read_wrapper_stamp(path: &Path) -> Value {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return Value::Null;
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Value::Null;
-    }
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.len() < 2 {
-        return json!({ "raw": trimmed });
-    }
-    let mut payload = json!({
-        "signature": parts[0],
-        "epoch": parts[1],
-    });
-    if let Ok(epoch) = parts[1].parse::<u64>() {
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("timestamp".to_string(), json!(epoch));
-        }
-    }
-    payload
 }
 
 fn read_wrapper_mode(path: &Path) -> Value {

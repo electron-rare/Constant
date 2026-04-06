@@ -21,6 +21,8 @@ pub struct PaneStatus {
     pub active: bool,
     pub dead: bool,
     pub dead_status: i32,
+    pub autorestart_failures: u32,
+    pub autorestart_disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +141,23 @@ pub fn cockpit_doctor(local_session: &str, machine_session: &str) -> Result<Valu
         },
         "status": payload,
     }))
+}
+
+pub fn cockpit_status_line(
+    workspace: &str,
+    scope_label: Option<&str>,
+    machine_label: Option<&str>,
+    max_length: usize,
+    local_session: &str,
+    machine_session: &str,
+) -> Result<String, String> {
+    let chat_line =
+        crate::chat::render_chat_dock_line(workspace, scope_label, machine_label, max_length)?;
+    let runtime = runtime_status(local_session, machine_session)?;
+    if let Some(warning) = autorestart_warning(&runtime) {
+        return Ok(clip_line(&format!("{chat_line} | {warning}"), max_length));
+    }
+    Ok(chat_line)
 }
 
 pub fn cockpit_open(
@@ -325,7 +344,7 @@ fn parse_panes(stdout: &str) -> Vec<PaneStatus> {
         .lines()
         .filter_map(|raw| {
             let parts = raw.split('\t').collect::<Vec<_>>();
-            if parts.len() != 10 {
+            if parts.len() != 12 {
                 return None;
             }
             let role = if !parts[4].is_empty() {
@@ -347,6 +366,8 @@ fn parse_panes(stdout: &str) -> Vec<PaneStatus> {
                 active: parts[7] == "1",
                 dead: parts[8] == "1",
                 dead_status: parts[9].parse().unwrap_or(0),
+                autorestart_failures: parts[10].parse().unwrap_or(0),
+                autorestart_disabled: parts[11] == "1",
             })
         })
         .collect::<Vec<_>>();
@@ -361,8 +382,36 @@ fn tmux_list_command(session_name: &str) -> Vec<String> {
         "-t".to_string(),
         session_name.to_string(),
         "-F".to_string(),
-        "#{session_name}\t#{window_name}\t#{pane_id}\t#{pane_index}\t#{@constant_role}\t#{pane_title}\t#{pane_current_command}\t#{pane_active}\t#{pane_dead}\t#{pane_dead_status}".to_string(),
+        "#{session_name}\t#{window_name}\t#{pane_id}\t#{pane_index}\t#{@constant_role}\t#{pane_title}\t#{pane_current_command}\t#{pane_active}\t#{pane_dead}\t#{pane_dead_status}\t#{@constant_restart_failures}\t#{@constant_autorestart_disabled}".to_string(),
     ]
+}
+
+fn autorestart_warning(runtime: &FleetRuntimeStatus) -> Option<String> {
+    for machine in &runtime.machines {
+        for pane in &machine.panes {
+            if pane.autorestart_disabled {
+                return Some(format!(
+                    "respawn disabled after {} failures: {}",
+                    pane.autorestart_failures.max(1),
+                    pane.role
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn clip_line(line: &str, max_length: usize) -> String {
+    if line.len() <= max_length {
+        return line.to_string();
+    }
+    format!(
+        "{}...",
+        line.chars()
+            .take(max_length.saturating_sub(3))
+            .collect::<String>()
+            .trim_end()
+    )
 }
 
 fn ssh_command(target: &str, inner: &str) -> Vec<String> {

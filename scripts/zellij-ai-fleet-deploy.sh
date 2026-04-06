@@ -196,32 +196,7 @@ probe_seed() {
 
 render_scan_json() {
     local candidates_file="$1"
-    python3 - "$candidates_file" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-candidates = []
-for raw in path.read_text(encoding="utf-8").splitlines():
-    if not raw.strip():
-        continue
-    seed, user, host, port, reachable, remote_name, remote_os, remote_home, error = raw.split("\t", 8)
-    candidates.append(
-        {
-            "seed": seed,
-            "user": user,
-            "host": host,
-            "port": int(port),
-            "reachable": reachable == "yes",
-            "remote_name": remote_name,
-            "remote_os": remote_os,
-            "remote_home": remote_home,
-            "error": error,
-        }
-    )
-print(json.dumps({"candidates": candidates}, indent=2))
-PY
+    "$script_dir/Constant" fleet render-scan-json "$candidates_file"
 }
 
 print_scan_table() {
@@ -426,55 +401,7 @@ write_fleet_config() {
     local finalized_file="$1"
     local output_path="$2"
     local repo_dir="$3"
-
-    python3 - "$finalized_file" "$output_path" "$repo_dir" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-finalized = Path(sys.argv[1])
-output = Path(sys.argv[2]).expanduser()
-repo_dir = sys.argv[3]
-
-machines = []
-local_machine = None
-for raw in finalized.read_text(encoding="utf-8").splitlines():
-    if not raw.strip():
-        continue
-    label, role, user, seed = raw.split("\t", 3)
-    if role == "local":
-        local_machine = label
-        machines.append(
-            {
-                "label": label,
-                "target": "local",
-                "auto_clis": ["codex", "vibe", "claude"],
-                "manual_clis": ["copilot"],
-                "backends": ["omc", "cli-local", "cockpit"],
-            }
-        )
-    else:
-        machines.append(
-            {
-                "label": label,
-                "target": f"{user}@{seed}",
-                "auto_clis": ["codex", "vibe", "claude"],
-                "manual_clis": ["copilot"],
-                "backends": ["cli-ssh", "cockpit"],
-            }
-        )
-
-payload = {
-    "version": 1,
-    "local_machine": local_machine or "command-center",
-    "repo_dir": repo_dir,
-    "machines": machines,
-}
-
-output.parent.mkdir(parents=True, exist_ok=True)
-output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-print(str(output))
-PY
+    "$script_dir/Constant" fleet write-config "$finalized_file" --output "$output_path" --repo-dir "$repo_dir"
 }
 
 run_install() {
@@ -583,7 +510,6 @@ if [[ -z "$default_user" ]]; then
 fi
 
 zellij_ai_require_command ssh
-zellij_ai_require_command python3
 
 candidates_file="$(discover_candidates "$explicit_hosts_file" "$default_user" "$use_ssh_config" "$use_known_hosts" "$use_arp")"
 rm -f "$explicit_hosts_file"

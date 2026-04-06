@@ -44,11 +44,30 @@ require_arg() {
     fi
 }
 
+window_pane_id() {
+    local session_name="$1"
+    local window_name="$2"
+    tmux list-panes -t "${session_name}:${window_name}" -F '#{pane_id}' 2>/dev/null | head -n 1
+}
+
+mark_window_managed() {
+    local session_name="$1"
+    local window_name="$2"
+    local role_label="$3"
+    local command_string="$4"
+    local pane_id
+
+    pane_id="$(window_pane_id "$session_name" "$window_name")"
+    if [[ -z "$pane_id" ]]; then
+        return 1
+    fi
+    constant_tmux_set_managed_pane "$pane_id" "$role_label" "$command_string"
+}
+
 build_constant_window_command() {
     local cmd=(
         env
         "PATH=$(zellij_ai_agent_path)"
-        "CONSTANT_USE_PYTHON=1"
         "$repo_dir/scripts/Constant"
         tui
         --workspace "$workspace"
@@ -111,23 +130,9 @@ link_local_window() {
 configure_fleet_session() {
     local session_name="$1"
     tmux rename-window -t "${session_name}:0" Constant >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g set-clipboard on >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g remain-on-exit on >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g mouse on >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g status on >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g status-position top >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g status-justify left >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g status-left-length 24 >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g status-right-length 48 >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g status-left '#[fg=black,bg=green,bold] Constant #[default] ' >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g status-right '#[fg=colour250]#S #[fg=colour244]| #[fg=colour252]%H:%M #[fg=colour244]%d-%b' >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g status-style 'bg=colour234,fg=colour252' >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g window-status-separator ' ' >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g window-status-format '#[fg=colour245,bg=colour236] #I:#W ' >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g window-status-current-format '#[fg=colour16,bg=colour46,bold] #I:#W ' >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g window-status-current-style 'fg=colour16,bg=colour46,bold' >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g allow-rename off >/dev/null 2>&1 || true
-    tmux set-option -t "$session_name" -g automatic-rename off >/dev/null 2>&1 || true
+    constant_tmux_configure_autorestart_hook "$session_name"
+    constant_tmux_configure_status_chrome "$session_name" "Constant" "green"
+    constant_tmux_configure_chat_dock "$session_name" "$repo_dir" "$workspace" "fleet" ""
 }
 
 attach_fleet_session() {
@@ -154,8 +159,10 @@ ensure_constant_window() {
         if window_pane_dead "$local_session" "Constant"; then
             tmux respawn-pane -k -t "${local_session}:Constant" "$command_string"
         fi
+        mark_window_managed "$local_session" "Constant" "constant" "$command_string" >/dev/null 2>&1 || true
     else
         tmux new-window -d -t "${local_session}:" -n Constant "$command_string"
+        mark_window_managed "$local_session" "Constant" "constant" "$command_string" >/dev/null 2>&1 || true
     fi
 }
 
@@ -168,8 +175,10 @@ ensure_remote_window() {
         if window_pane_dead "$local_session" "$label"; then
             tmux respawn-pane -k -t "${local_session}:${label}" "$command_string"
         fi
+        mark_window_managed "$local_session" "$label" "$label" "$command_string" >/dev/null 2>&1 || true
     else
         tmux new-window -d -t "${local_session}:" -n "$label" "$command_string"
+        mark_window_managed "$local_session" "$label" "$label" "$command_string" >/dev/null 2>&1 || true
     fi
 }
 

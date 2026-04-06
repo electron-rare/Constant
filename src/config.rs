@@ -173,6 +173,23 @@ pub fn load_fleet_config() -> Result<FleetConfig, String> {
     Ok(config)
 }
 
+pub fn read_fleet_config_if_present() -> Result<Option<FleetConfig>, String> {
+    paths::ensure_runtime_dirs()?;
+
+    let mut config = if paths::fleet_toml_path().exists() {
+        parse_toml_file(&paths::fleet_toml_path())?
+    } else if paths::fleet_json_path().exists() {
+        parse_json_file(&paths::fleet_json_path())?
+    } else if paths::fleet_yaml_path().exists() {
+        parse_json_file(&paths::fleet_yaml_path())?
+    } else {
+        return Ok(None);
+    };
+
+    normalize_fleet(&mut config);
+    Ok(Some(config))
+}
+
 pub fn load_models_config() -> Result<ModelsConfig, String> {
     let config = load_with_legacy(
         &paths::models_toml_path(),
@@ -210,6 +227,24 @@ pub fn save_memory_config(config: &MemoryConfig) -> Result<(), String> {
         &paths::memory_json_path(),
         config,
     )
+}
+
+pub fn write_fleet_config_file(path: &Path, config: &FleetConfig) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
+    }
+
+    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let text = if ext.eq_ignore_ascii_case("toml") {
+        toml::to_string_pretty(config).map_err(|err| format!("cannot encode TOML: {err}"))?
+    } else {
+        serde_json::to_string_pretty(config)
+            .map_err(|err| format!("cannot encode JSON: {err}"))?
+    };
+
+    fs::write(path, format!("{text}\n"))
+        .map_err(|err| format!("cannot write {}: {err}", path.display()))
 }
 
 pub fn fleet_machine<'a>(

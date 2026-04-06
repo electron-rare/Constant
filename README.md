@@ -40,35 +40,33 @@ Current build status in this repo:
 - a 4-pane host-local `tmux` session per machine
 - a fleet cockpit with one window per machine plus a central `Constant` window
 - `Constant`, the orchestration CLI on top of the cockpit
-- a terminal TUI with a central `hexapus` buddy rail
+- a native Rust chat-first TUI with composer, threads, and cockpit panes
 - live cockpit controls for focus, capture, send, and pane restart
 - local mission planning and verification
 - host-local execution for `claude`, `codex`, and `vibe`
 - `copilot` as a manual lane
 - local message bus + cross-machine bridge
-- MLX-ready model plumbing for a small local orchestrator stack on macOS
+- heuristic local routing and buddy/planner responses without a Python runtime
 - workspace-first durable memory with lexical + local vector search
 
 The canonical script surface is `constant-*`.
 Legacy `zellij-ai-*` aliases remain only as compatibility shims.
 
-Migration note:
+Runtime notes:
 
-- the entrypoint is now moving to Rust
-- `doctor`, `agents`, `skills`, `tui`, `cockpit`, `mission create`, `mission plan`, `mission run`, `mission status`, `mission tail`, `mission verify`, `mission retry`, `mission summarize`, and `delegate` now run from the Rust binary
-- Rust now prefers `fleet.toml`, `models.toml`, and `memory.toml`, while keeping JSON mirrors for compatibility during migration
-- `memory`, `buddy`, and `fleet` still hand off to the existing Python core during migration
-- the public `./scripts/Constant` wrapper now tries the Rust binary first, but runs a fast startup probe before handing control over
-- if macOS stalls in code-signing / policy evaluation for freshly built binaries, the wrapper falls back automatically to the stable Python path
-- when `constant` is launched from inside the Codex runner itself, the wrapper skips the Rust path entirely and goes straight to Python to avoid the known macOS startup stall in that environment
-- use `CONSTANT_USE_RUST=1 ./scripts/Constant ...` to force the raw Rust path, or `CONSTANT_USE_PYTHON=1 ./scripts/Constant ...` to force Python
-- after changing macOS security settings, use `CONSTANT_RUST_RECHECK=1 ./scripts/Constant ...` to force a fresh Rust startup probe instead of waiting for the fallback cache TTL
+- the public runtime is now Rust-only
+- `doctor`, `agents`, `skills`, `models`, `memory`, `buddy`, `fleet`, `tui`, `cockpit`, and mission commands all execute from the Rust binary
+- the public `./scripts/Constant` wrapper rebuilds the Rust binary when sources change, then launches it directly
+- the wrapper ad-hoc signs the rebuilt binary on macOS when `codesign` is available
+- chat thread indexes now live in persisted sidecars under `~/.local/share/constant/indexes/chat`
+- unread state persists separately per workspace/user view
+- `constant mission delete <mission_id>` is now enforced in Rust and refuses `draft`, `planned`, or `running` missions
+- `constant cockpit status-line` now powers the tmux chat dock and surfaces disabled autorestart warnings
 
 macOS note:
 
-- if Rust keeps falling back from a normal terminal app, check `System Settings -> Privacy & Security -> Developer Tools`
-- allow your terminal app there so it can run locally built binaries without extra security-policy stalls
-- then rerun with `CONSTANT_RUST_RECHECK=1 ./scripts/Constant --help`
+- if Gatekeeper blocks a freshly built binary from your terminal, allow that terminal under `System Settings -> Privacy & Security -> Developer Tools`
+- then rerun `./scripts/Constant --help`
 
 ## Why This Exists
 
@@ -177,7 +175,7 @@ Create and route missions through these skills today with the Rust CLI:
 ./scripts/Constant delegate <mission_id> --skill architecture-brainstorm --json
 ```
 
-The richer conversation-first chat surface is still part of the Python-side migration path.
+The conversation-first chat surface is now native to the Rust TUI.
 
 ### 4. Durable memory
 
@@ -248,16 +246,18 @@ codex login --device-auth
 ./scripts/Constant doctor
 ./scripts/Constant cockpit doctor --json
 ./scripts/Constant cockpit status --json
+./scripts/Constant cockpit status-line --workspace "$PWD"
 ./scripts/Constant cockpit focus --machine command-center --pane codex
 ./scripts/Constant cockpit capture --machine command-center --pane claude
 ./scripts/Constant mission create "audit the repo" --workspace "$PWD"
+./scripts/Constant mission delete <mission_id> --json
 ./scripts/Constant mission status
 ./scripts/Constant memory rebuild --workspace "$PWD"
 ./scripts/Constant memory search "buddy rail" --workspace "$PWD"
+./scripts/Constant memory sync-qdrant --workspace "$PWD" --json
 ./scripts/Constant cockpit open --workspace "$PWD"
-./scripts/Constant fleet discover --json
-./scripts/Constant fleet configure
-./scripts/Constant fleet deploy
+./scripts/Constant fleet status --json
+./scripts/Constant fleet sync --json
 ```
 
 If `Constant` is on your `PATH`, you can also just run:
@@ -275,7 +275,7 @@ That means:
 - the `Constant` TUI inside the central `Constant` window
 - one machine window per host in the fleet
 
-For now, the central `Constant` window is intentionally forced onto the richer Python chat-first TUI so the UX stays closer to a Claude Code-style conversation surface while the Rust TUI is still catching up.
+The central `Constant` window now runs the native Rust chat-first TUI directly.
 
 The current interaction model is:
 
@@ -310,10 +310,6 @@ Examples:
 ./scripts/constant-deploy.sh scan --json
 ./scripts/constant-deploy.sh configure
 ./scripts/constant-deploy.sh deploy
-
-Constant fleet discover --json
-Constant fleet configure --host dev@builder-a --host dev@edge-a
-Constant fleet deploy --repo-dir '$HOME/constant'
 ```
 
 You can pass raw SSH seeds such as:
@@ -327,7 +323,7 @@ If `fleet.toml` or `fleet.json` contains `repo_dir`, the shell launchers and fle
 For a fully non-interactive run, pass explicit hosts and `--yes`:
 
 ```bash
-Constant fleet configure \
+./scripts/constant-deploy.sh configure \
   --host builder-a \
   --host builder-b \
   --user dev \
@@ -345,7 +341,7 @@ Constant fleet configure \
 - a chat-focus mode that behaves closer to Claude Code
 - a detailed cockpit view you can toggle back in when needed
 - a capture popup for pane output
-- a `hexapus` buddy rail
+- persistent unread tracking across sessions
 - a bottom status / key strip
 
 Useful keys:
@@ -378,7 +374,7 @@ The command-center machine is where you run:
 
 - `Constant`
 - the fleet cockpit
-- local MLX orchestration
+- local heuristic orchestration
 - any human-in-the-loop supervision
 
 The workers are where execution happens.
@@ -391,7 +387,7 @@ cp examples/fleet.example.toml ~/.config/constant/fleet.toml
 ```
 
 Legacy `~/.config/constant/fleet.json` and `fleet.yaml` are still read for compatibility, but the native format is now TOML.
-The shell launchers read both `fleet.toml` and `fleet.json`, so fleet tabs, install/check, and bridge helpers stay aligned during the migration.
+The shell launchers and Rust CLI read both `fleet.toml` and `fleet.json`, so fleet tabs, install/check, and bridge helpers stay aligned.
 
 ## Messaging
 
@@ -458,7 +454,6 @@ Not like a magic trick.
 Planned layers for the public `Constant` repo:
 
 - a real demoscene-style TUI
-- a central `hexapus` buddy rail
 - durable memory with vector + lexical search
 - mission summaries and decision graph browsing
 - richer repo context and instruction fusion
@@ -468,8 +463,8 @@ Planned layers for the public `Constant` repo:
 ## Repo Layout
 
 ```text
-constant/                         Python orchestration core
-src/                              Rust CLI, missions, cockpit, and native TUI
+src/                              Rust CLI, missions, cockpit, native TUI, memory, and chat store
+tests/                            Rust integration tests
 examples/fleet.example.json       public fleet template
 examples/fleet.example.toml       public fleet template in the native config format
 scripts/Constant                  canonical CLI entrypoint

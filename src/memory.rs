@@ -707,6 +707,83 @@ pub fn summarize_mission_to_memory(mission: &Mission) -> Result<Value, String> {
     }))
 }
 
+pub fn sync_qdrant(workspace: Option<&str>) -> Result<Value, String> {
+    ensure_schema()?;
+    let config = load_memory_config()?;
+    let url = config.qdrant_url.trim().to_string();
+    if url.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "skipped": true,
+            "reason": "qdrant_url is not configured",
+        }));
+    }
+
+    let hits = search_memory("*", workspace, Some(32))?
+        .get("hits")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let points = hits
+        .iter()
+        .map(|hit| {
+            let kind = hit.get("kind").and_then(Value::as_str).unwrap_or("memory");
+            let path = hit.get("path").and_then(Value::as_str).unwrap_or("-");
+            let snippet = hit.get("snippet").and_then(Value::as_str).unwrap_or("");
+            json!({
+                "id": stable_point_id(kind, path),
+                "vector": embed_text(snippet, config.vector_dimensions as usize),
+                "payload": hit,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let endpoint = format!(
+        "{}/collections/{}/points?wait=true",
+        url.trim_end_matches('/'),
+        config.qdrant_collection
+    );
+    let body = json!({ "points": points });
+    let output = Command::new("curl")
+        .args([
+            "-fsS",
+            "-X",
+            "PUT",
+            "-H",
+            "Content-Type: application/json",
+            &endpoint,
+            "--data-binary",
+            &body.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let payload: Value = serde_json::from_slice(&output.stdout)
+                .map_err(|err| format!("cannot decode qdrant response: {err}"))?;
+            Ok(json!({
+                "ok": true,
+                "response": payload,
+                "points": body["points"].as_array().map(|items| items.len()).unwrap_or(0),
+            }))
+        }
+        Ok(output) => Ok(json!({
+            "ok": false,
+            "skipped": false,
+            "reason": String::from_utf8_lossy(&output.stderr).trim(),
+            "points": body["points"].as_array().map(|items| items.len()).unwrap_or(0),
+        })),
+        Err(err) => Ok(json!({
+            "ok": false,
+            "skipped": false,
+            "reason": err.to_string(),
+            "points": body["points"].as_array().map(|items| items.len()).unwrap_or(0),
+        })),
+    }
+}
+
 fn ensure_schema() -> Result<(), String> {
     let db = paths::memory_store_path();
     if let Some(parent) = db.parent() {
@@ -1183,6 +1260,50 @@ fn tokenize(text: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+fn embed_text(text: &str, dims: usize) -> Vec<f64> {
+    let mut vector = vec![0.0_f64; dims];
+    if dims == 0 {
+        return vector;
+    }
+    let mut counts = BTreeMap::new();
+    for token in tokenize(text) {
+        *counts.entry(token).or_insert(0_u32) += 1;
+    }
+    for (token, count) in counts {
+        let digest = sha256_text(&token);
+        let bytes = digest.as_bytes();
+        let mut index_seed = 0_u32;
+        for byte in bytes.iter().take(4) {
+            index_seed = (index_seed << 8) | *byte as u32;
+        }
+        let index = index_seed as usize % dims;
+        let sign = if bytes.get(4).copied().unwrap_or(b'0') % 2 == 0 {
+            1.0
+        } else {
+            -1.0
+        };
+        vector[index] += sign * (1.0 + f64::from(count).ln_1p());
+    }
+    let norm = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if norm == 0.0 {
+        return vector;
+    }
+    vector
+        .into_iter()
+        .map(|value| ((value / norm) * 1_000_000.0).round() / 1_000_000.0)
+        .collect()
+}
+
+fn stable_point_id(kind: &str, path: &str) -> i64 {
+    let raw = format!("{kind}:{path}");
+    let digest = sha256_text(&raw);
+    let mut value = 0_i64;
+    for byte in digest.as_bytes().iter().take(8) {
+        value = (value << 8) | i64::from(*byte);
+    }
+    value.abs()
 }
 
 fn lexical_score(text: &str, query: &str) -> f64 {

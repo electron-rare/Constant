@@ -31,6 +31,26 @@ pub fn data_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".local/share/constant"))
 }
 
+pub fn expand_home_string(value: &str) -> PathBuf {
+    if value == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(value));
+    }
+    if value == "$HOME" {
+        return home_dir().unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("$HOME/") {
+        return home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(value));
+    }
+    PathBuf::from(value)
+}
+
 pub fn planner_dir() -> PathBuf {
     cache_root().join("planner")
 }
@@ -92,6 +112,18 @@ pub fn indexes_dir() -> PathBuf {
     data_root().join("indexes")
 }
 
+pub fn chat_indexes_dir() -> PathBuf {
+    indexes_dir().join("chat")
+}
+
+pub fn chat_threads_index_dir() -> PathBuf {
+    chat_indexes_dir().join("threads")
+}
+
+pub fn chat_views_dir() -> PathBuf {
+    chat_indexes_dir().join("views")
+}
+
 pub fn memory_sources_dir() -> PathBuf {
     data_root().join("sources")
 }
@@ -121,6 +153,9 @@ pub fn ensure_runtime_dirs() -> Result<(), String> {
         data_root(),
         missions_dir(),
         indexes_dir(),
+        chat_indexes_dir(),
+        chat_threads_index_dir(),
+        chat_views_dir(),
         memory_sources_dir(),
         planner_dir(),
     ] {
